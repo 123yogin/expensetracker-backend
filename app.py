@@ -110,8 +110,8 @@ def create_app(testing: bool = False):
 
 
 # Create app instance for Gunicorn (production)
-# Gunicorn will call: gunicorn app:application
-application = create_app()
+# Gunicorn will call: gunicorn app:app
+app = create_app()
 
 
 # Local development
@@ -120,7 +120,7 @@ if __name__ == '__main__':
     # Set FLASK_DEBUG=true environment variable for development
     debug_mode = os.environ.get('FLASK_DEBUG', 'False').lower() == 'true'
     
-    application.run(
+    app.run(
         debug=debug_mode,
         host='0.0.0.0',
         port=int(os.environ.get('PORT', 5000))
