@@ -45,19 +45,20 @@ def monthly_summary():
     
     db = get_db()
     try:
-        # Single SQL query for all aggregations (no N+1 queries)
-        cursor = db.execute(
-            """SELECT 
-                   COUNT(*) as transaction_count,
-                   COALESCE(SUM(amount), 0) as total_amount,
-                   COALESCE(AVG(amount), 0) as average_amount,
-                   COALESCE(MIN(amount), 0) as min_amount,
-                   COALESCE(MAX(amount), 0) as max_amount
-               FROM expenses
-               WHERE date >= ? AND date <= ?""",
-            (start_date, end_date)
-        )
-        row = cursor.fetchone()
+        with db.cursor() as cursor:
+            # Single SQL query for all aggregations (no N+1 queries)
+            cursor.execute(
+                """SELECT 
+                       COUNT(*) as transaction_count,
+                       COALESCE(SUM(amount), 0) as total_amount,
+                       COALESCE(AVG(amount), 0) as average_amount,
+                       COALESCE(MIN(amount), 0) as min_amount,
+                       COALESCE(MAX(amount), 0) as max_amount
+                   FROM expenses
+                   WHERE date >= %s AND date <= %s""",
+                (start_date, end_date)
+            )
+            row = cursor.fetchone()
         
         return jsonify({
             'month': month,
@@ -102,33 +103,34 @@ def category_breakdown():
     
     db = get_db()
     try:
-        # Single query to get total for percentage calculation
-        cursor = db.execute(
-            """SELECT COALESCE(SUM(amount), 0) as total
-               FROM expenses
-               WHERE date >= ? AND date <= ?""",
-            (start_date, end_date)
-        )
-        total_row = cursor.fetchone()
-        total_amount = Decimal(str(total_row['total'])) if total_row['total'] else Decimal('0')
-        
-        # Single query with LEFT JOIN and GROUP BY (aggregation in SQL)
-        # This avoids N+1 queries - we get all categories with their totals at once
-        cursor = db.execute(
-            """SELECT 
-                   c.id as category_id,
-                   c.name as category_name,
-                   COUNT(e.id) as transaction_count,
-                   COALESCE(SUM(e.amount), 0) as total_amount
-               FROM categories c
-               LEFT JOIN expenses e ON c.id = e.category_id 
-                   AND e.date >= ? AND e.date <= ?
-               WHERE c.is_active = 1
-               GROUP BY c.id, c.name
-               ORDER BY total_amount DESC""",
-            (start_date, end_date)
-        )
-        categories = cursor.fetchall()
+        with db.cursor() as cursor:
+            # Single query to get total for percentage calculation
+            cursor.execute(
+                """SELECT COALESCE(SUM(amount), 0) as total
+                   FROM expenses
+                   WHERE date >= %s AND date <= %s""",
+                (start_date, end_date)
+            )
+            total_row = cursor.fetchone()
+            total_amount = Decimal(str(total_row['total'])) if total_row['total'] else Decimal('0')
+            
+            # Single query with LEFT JOIN and GROUP BY (aggregation in SQL)
+            # This avoids N+1 queries - we get all categories with their totals at once
+            cursor.execute(
+                """SELECT 
+                       c.id as category_id,
+                       c.name as category_name,
+                       COUNT(e.id) as transaction_count,
+                       COALESCE(SUM(e.amount), 0) as total_amount
+                   FROM categories c
+                   LEFT JOIN expenses e ON c.id = e.category_id 
+                       AND e.date >= %s AND e.date <= %s
+                   WHERE c.is_active = TRUE
+                   GROUP BY c.id, c.name
+                   ORDER BY total_amount DESC""",
+                (start_date, end_date)
+            )
+            categories = cursor.fetchall()
         
         # Build breakdown with percentages (minimal Python processing)
         breakdown = []
@@ -183,19 +185,20 @@ def daily_trend():
     
     db = get_db()
     try:
-        # Single SQL query with GROUP BY for aggregation (not looping in Python)
-        cursor = db.execute(
-            """SELECT 
-                   date,
-                   COUNT(*) as transaction_count,
-                   SUM(amount) as total_amount
-               FROM expenses
-               WHERE date >= ? AND date <= ?
-               GROUP BY date
-               ORDER BY date ASC""",
-            (start_date, end_date)
-        )
-        daily_data = cursor.fetchall()
+        with db.cursor() as cursor:
+            # Single SQL query with GROUP BY for aggregation (not looping in Python)
+            cursor.execute(
+                """SELECT 
+                       date,
+                       COUNT(*) as transaction_count,
+                       SUM(amount) as total_amount
+                   FROM expenses
+                   WHERE date >= %s AND date <= %s
+                   GROUP BY date
+                   ORDER BY date ASC""",
+                (start_date, end_date)
+            )
+            daily_data = cursor.fetchall()
         
         # Calculate running total (this must be done in order, so Python is appropriate)
         running_total = Decimal('0')
@@ -206,7 +209,7 @@ def daily_trend():
             running_total += day_amount
             
             trend.append({
-                'date': row['date'],
+                'date': str(row['date']) if row['date'] else None,
                 'transaction_count': row['transaction_count'],
                 'daily_total': format_amount(day_amount),
                 'running_total': format_amount(running_total)

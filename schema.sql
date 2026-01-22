@@ -1,12 +1,11 @@
--- SQL Schema for Personal Expense Tracker
--- Execute PRAGMA foreign_keys = ON on every connection
+-- SQL Schema for Personal Expense Tracker (PostgreSQL)
 
 -- Categories Table
 CREATE TABLE IF NOT EXISTS categories (
     id TEXT PRIMARY KEY,
     name TEXT UNIQUE NOT NULL,
-    is_active INTEGER DEFAULT 1,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    is_active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 -- Expenses Table
@@ -14,11 +13,10 @@ CREATE TABLE IF NOT EXISTS expenses (
     id TEXT PRIMARY KEY,
     date DATE NOT NULL,
     amount DECIMAL(10,2) NOT NULL,
-    category_id TEXT NOT NULL,
+    category_id TEXT NOT NULL REFERENCES categories(id),
     note TEXT,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    updated_at DATETIME,
-    FOREIGN KEY(category_id) REFERENCES categories(id)
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP
 );
 
 -- Index for faster queries on expenses

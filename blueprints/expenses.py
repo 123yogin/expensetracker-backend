@@ -9,7 +9,7 @@ Production-hardened endpoints:
 - Proper error handling without leaking stack traces
 """
 
-import sqlite3
+import psycopg2
 from flask import Blueprint, request, jsonify
 
 from database import get_db
@@ -35,13 +35,13 @@ def format_expense(row) -> dict:
     """
     return {
         'id': row['id'],
-        'date': row['date'],
+        'date': str(row['date']) if row['date'] else None,
         'amount': format_amount(row['amount']),
         'category_id': row['category_id'],
         'category_name': row['category_name'],
         'note': row['note'],
-        'created_at': row['created_at'],
-        'updated_at': row['updated_at']
+        'created_at': str(row['created_at']) if row['created_at'] else None,
+        'updated_at': str(row['updated_at']) if row['updated_at'] else None
     }
 
 
@@ -82,21 +82,21 @@ def get_expenses():
         valid, error = validate_date(start_date, reject_future=False)
         if not valid:
             return error_response(f'Invalid start_date: {error}', 400)
-        query += " AND e.date >= ?"
+        query += " AND e.date >= %s"
         params.append(start_date)
     
     if end_date:
         valid, error = validate_date(end_date, reject_future=False)
         if not valid:
             return error_response(f'Invalid end_date: {error}', 400)
-        query += " AND e.date <= ?"
+        query += " AND e.date <= %s"
         params.append(end_date)
     
     if category_id:
         valid, error = validate_uuid(category_id)
         if not valid:
             return error_response(f'Invalid category_id: {error}', 400)
-        query += " AND e.category_id = ?"
+        query += " AND e.category_id = %s"
         params.append(category_id)
     
     # Order by date descending, then by creation time
@@ -104,8 +104,9 @@ def get_expenses():
     
     db = get_db()
     try:
-        cursor = db.execute(query, params)
-        expenses = cursor.fetchall()
+        with db.cursor() as cursor:
+            cursor.execute(query, params)
+            expenses = cursor.fetchall()
         return jsonify([format_expense(row) for row in expenses]), 200
     except Exception as e:
         return handle_db_error(e)
@@ -169,36 +170,39 @@ def create_expense():
     
     db = get_db()
     try:
-        # Verify category exists and is active (single query)
-        cursor = db.execute(
-            "SELECT id FROM categories WHERE id = ? AND is_active = 1",
-            (category_id,)
-        )
-        if not cursor.fetchone():
-            return error_response('Category not found or inactive', 404)
-        
-        # Insert expense with validated amount as string (stored as DECIMAL)
-        db.execute(
-            """INSERT INTO expenses (id, date, amount, category_id, note)
-               VALUES (?, ?, ?, ?, ?)""",
-            (expense_id, date, str(validated_amount), category_id, note)
-        )
-        db.commit()
-        
-        # Fetch the created expense with category name
-        cursor = db.execute(
-            EXPENSE_SELECT_QUERY + " WHERE e.id = ?",
-            (expense_id,)
-        )
-        expense = cursor.fetchone()
+        with db.cursor() as cursor:
+            # Verify category exists and is active (single query)
+            cursor.execute(
+                "SELECT id FROM categories WHERE id = %s AND is_active = TRUE",
+                (category_id,)
+            )
+            if not cursor.fetchone():
+                return error_response('Category not found or inactive', 404)
+            
+            # Insert expense with validated amount as string (stored as DECIMAL)
+            cursor.execute(
+                """INSERT INTO expenses (id, date, amount, category_id, note)
+                   VALUES (%s, %s, %s, %s, %s)""",
+                (expense_id, date, str(validated_amount), category_id, note)
+            )
+            db.commit()
+            
+            # Fetch the created expense with category name
+            cursor.execute(
+                EXPENSE_SELECT_QUERY + " WHERE e.id = %s",
+                (expense_id,)
+            )
+            expense = cursor.fetchone()
         
         return jsonify(format_expense(expense)), 201
         
-    except sqlite3.IntegrityError as e:
-        if 'FOREIGN KEY constraint failed' in str(e):
+    except psycopg2.IntegrityError as e:
+        db.rollback()
+        if 'foreign key' in str(e).lower():
             return error_response('Invalid category ID', 400)
         return handle_db_error(e)
     except Exception as e:
+        db.rollback()
         return handle_db_error(e)
 
 
@@ -232,85 +236,88 @@ def update_expense(expense_id):
     
     db = get_db()
     try:
-        # Check if expense exists
-        cursor = db.execute(
-            "SELECT id FROM expenses WHERE id = ?",
-            (expense_id,)
-        )
-        if not cursor.fetchone():
-            return error_response('Expense not found', 404)
-        
-        # Build update query dynamically based on provided fields
-        updates = []
-        params = []
-        
-        if 'date' in data:
-            valid, error = validate_date(data['date'], reject_future=True)
-            if not valid:
-                return error_response(error, 400)
-            updates.append("date = ?")
-            params.append(data['date'])
-        
-        if 'amount' in data:
-            validated_amount, error = validate_amount(data['amount'])
-            if error:
-                return error_response(error, 400)
-            updates.append("amount = ?")
-            params.append(str(validated_amount))
-        
-        if 'category_id' in data:
-            category_id = data['category_id']
-            valid, error = validate_uuid(category_id)
-            if not valid:
-                return error_response(f'Invalid category_id: {error}', 400)
-            
-            # Verify category exists and is active
-            cursor = db.execute(
-                "SELECT id FROM categories WHERE id = ? AND is_active = 1",
-                (category_id,)
+        with db.cursor() as cursor:
+            # Check if expense exists
+            cursor.execute(
+                "SELECT id FROM expenses WHERE id = %s",
+                (expense_id,)
             )
             if not cursor.fetchone():
-                return error_response('Category not found or inactive', 404)
+                return error_response('Expense not found', 404)
             
-            updates.append("category_id = ?")
-            params.append(category_id)
-        
-        if 'note' in data:
-            note = data['note'] or ''
-            if not isinstance(note, str):
-                return error_response('Note must be a string', 400)
-            note = note.strip()
-            if len(note) > 500:
-                return error_response('Note must be 500 characters or less', 400)
-            updates.append("note = ?")
-            params.append(note)
-        
-        if not updates:
-            return error_response('No fields to update', 400)
-        
-        # Add updated_at timestamp
-        updates.append("updated_at = CURRENT_TIMESTAMP")
-        params.append(expense_id)
-        
-        # Execute update (parameterized query for SQL injection safety)
-        query = f"UPDATE expenses SET {', '.join(updates)} WHERE id = ?"
-        db.execute(query, params)
-        db.commit()
-        
-        # Fetch the updated expense
-        cursor = db.execute(
-            EXPENSE_SELECT_QUERY + " WHERE e.id = ?",
-            (expense_id,)
-        )
-        expense = cursor.fetchone()
+            # Build update query dynamically based on provided fields
+            updates = []
+            params = []
+            
+            if 'date' in data:
+                valid, error = validate_date(data['date'], reject_future=True)
+                if not valid:
+                    return error_response(error, 400)
+                updates.append("date = %s")
+                params.append(data['date'])
+            
+            if 'amount' in data:
+                validated_amount, error = validate_amount(data['amount'])
+                if error:
+                    return error_response(error, 400)
+                updates.append("amount = %s")
+                params.append(str(validated_amount))
+            
+            if 'category_id' in data:
+                category_id = data['category_id']
+                valid, error = validate_uuid(category_id)
+                if not valid:
+                    return error_response(f'Invalid category_id: {error}', 400)
+                
+                # Verify category exists and is active
+                cursor.execute(
+                    "SELECT id FROM categories WHERE id = %s AND is_active = TRUE",
+                    (category_id,)
+                )
+                if not cursor.fetchone():
+                    return error_response('Category not found or inactive', 404)
+                
+                updates.append("category_id = %s")
+                params.append(category_id)
+            
+            if 'note' in data:
+                note = data['note'] or ''
+                if not isinstance(note, str):
+                    return error_response('Note must be a string', 400)
+                note = note.strip()
+                if len(note) > 500:
+                    return error_response('Note must be 500 characters or less', 400)
+                updates.append("note = %s")
+                params.append(note)
+            
+            if not updates:
+                return error_response('No fields to update', 400)
+            
+            # Add updated_at timestamp
+            updates.append("updated_at = CURRENT_TIMESTAMP")
+            params.append(expense_id)
+            
+            # Execute update (parameterized query for SQL injection safety)
+            query = f"UPDATE expenses SET {', '.join(updates)} WHERE id = %s"
+            cursor.execute(query, params)
+            db.commit()
+            
+            # Fetch the updated expense
+            cursor.execute(
+                EXPENSE_SELECT_QUERY + " WHERE e.id = %s",
+                (expense_id,)
+            )
+            expense = cursor.fetchone()
         
         return jsonify(format_expense(expense)), 200
         
-    except sqlite3.IntegrityError as e:
-        if 'FOREIGN KEY constraint failed' in str(e):
+    except psycopg2.IntegrityError as e:
+        db.rollback()
+        if 'foreign key' in str(e).lower():
             return error_response('Invalid category ID', 400)
         return handle_db_error(e)
     except Exception as e:
+        db.rollback()
         return handle_db_error(e)
 
 
@@ -332,18 +339,20 @@ def delete_expense(expense_id):
     
     db = get_db()
     try:
-        # Check if expense exists
-        cursor = db.execute(
-            "SELECT id FROM expenses WHERE id = ?",
-            (expense_id,)
-        )
-        if not cursor.fetchone():
-            return error_response('Expense not found', 404)
-        
-        db.execute("DELETE FROM expenses WHERE id = ?", (expense_id,))
-        db.commit()
+        with db.cursor() as cursor:
+            # Check if expense exists
+            cursor.execute(
+                "SELECT id FROM expenses WHERE id = %s",
+                (expense_id,)
+            )
+            if not cursor.fetchone():
+                return error_response('Expense not found', 404)
+            
+            cursor.execute("DELETE FROM expenses WHERE id = %s", (expense_id,))
+            db.commit()
         
         return jsonify({'message': 'Expense deleted successfully'}), 200
         
     except Exception as e:
+        db.rollback()
         return handle_db_error(e)

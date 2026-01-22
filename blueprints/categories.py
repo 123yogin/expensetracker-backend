@@ -7,7 +7,7 @@ Production-hardened endpoints:
 - Proper error handling without leaking stack traces
 """
 
-import sqlite3
+import psycopg2
 from flask import Blueprint, request, jsonify
 
 from database import get_db
@@ -27,7 +27,7 @@ def format_category(row) -> dict:
         'id': row['id'],
         'name': row['name'],
         'is_active': bool(row['is_active']),
-        'created_at': row['created_at']
+        'created_at': str(row['created_at']) if row['created_at'] else None
     }
 
 
@@ -40,12 +40,13 @@ def get_categories():
     """
     db = get_db()
     try:
-        cursor = db.execute(
-            """SELECT id, name, is_active, created_at 
-               FROM categories 
-               ORDER BY is_active DESC, name"""
-        )
-        categories = cursor.fetchall()
+        with db.cursor() as cursor:
+            cursor.execute(
+                """SELECT id, name, is_active, created_at 
+                   FROM categories 
+                   ORDER BY is_active DESC, name"""
+            )
+            categories = cursor.fetchall()
         return jsonify([format_category(row) for row in categories]), 200
     except Exception as e:
         return handle_db_error(e)
@@ -85,26 +86,29 @@ def create_category():
     
     db = get_db()
     try:
-        db.execute(
-            "INSERT INTO categories (id, name) VALUES (?, ?)",
-            (category_id, name)
-        )
-        db.commit()
-        
-        # Fetch the created category
-        cursor = db.execute(
-            "SELECT id, name, is_active, created_at FROM categories WHERE id = ?",
-            (category_id,)
-        )
-        category = cursor.fetchone()
+        with db.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO categories (id, name) VALUES (%s, %s)",
+                (category_id, name)
+            )
+            db.commit()
+            
+            # Fetch the created category
+            cursor.execute(
+                "SELECT id, name, is_active, created_at FROM categories WHERE id = %s",
+                (category_id,)
+            )
+            category = cursor.fetchone()
         
         return jsonify(format_category(category)), 201
         
-    except sqlite3.IntegrityError as e:
-        if 'UNIQUE constraint failed' in str(e):
+    except psycopg2.IntegrityError as e:
+        db.rollback()
+        if 'unique constraint' in str(e).lower() or 'duplicate key' in str(e).lower():
             return error_response('Category name already exists', 409)
         return handle_db_error(e)
     except Exception as e:
+        db.rollback()
         return handle_db_error(e)
 
 
@@ -144,34 +148,37 @@ def update_category(category_id):
     
     db = get_db()
     try:
-        # Check if category exists
-        cursor = db.execute(
-            "SELECT id FROM categories WHERE id = ?",
-            (category_id,)
-        )
-        if not cursor.fetchone():
-            return error_response('Category not found', 404)
-        
-        db.execute(
-            "UPDATE categories SET name = ? WHERE id = ?",
-            (name, category_id)
-        )
-        db.commit()
-        
-        # Fetch the updated category
-        cursor = db.execute(
-            "SELECT id, name, is_active, created_at FROM categories WHERE id = ?",
-            (category_id,)
-        )
-        category = cursor.fetchone()
+        with db.cursor() as cursor:
+            # Check if category exists
+            cursor.execute(
+                "SELECT id FROM categories WHERE id = %s",
+                (category_id,)
+            )
+            if not cursor.fetchone():
+                return error_response('Category not found', 404)
+            
+            cursor.execute(
+                "UPDATE categories SET name = %s WHERE id = %s",
+                (name, category_id)
+            )
+            db.commit()
+            
+            # Fetch the updated category
+            cursor.execute(
+                "SELECT id, name, is_active, created_at FROM categories WHERE id = %s",
+                (category_id,)
+            )
+            category = cursor.fetchone()
         
         return jsonify(format_category(category)), 200
         
-    except sqlite3.IntegrityError as e:
-        if 'UNIQUE constraint failed' in str(e):
+    except psycopg2.IntegrityError as e:
+        db.rollback()
+        if 'unique constraint' in str(e).lower() or 'duplicate key' in str(e).lower():
             return error_response('Category name already exists', 409)
         return handle_db_error(e)
     except Exception as e:
+        db.rollback()
         return handle_db_error(e)
 
 
@@ -202,32 +209,34 @@ def update_category_status(category_id):
     if not isinstance(data['is_active'], bool):
         return error_response('is_active must be a boolean', 400)
     
-    is_active = 1 if data['is_active'] else 0
+    is_active = data['is_active']
     
     db = get_db()
     try:
-        cursor = db.execute(
-            "SELECT id FROM categories WHERE id = ?",
-            (category_id,)
-        )
-        if not cursor.fetchone():
-            return error_response('Category not found', 404)
-        
-        db.execute(
-            "UPDATE categories SET is_active = ? WHERE id = ?",
-            (is_active, category_id)
-        )
-        db.commit()
-        
-        cursor = db.execute(
-            "SELECT id, name, is_active, created_at FROM categories WHERE id = ?",
-            (category_id,)
-        )
-        category = cursor.fetchone()
+        with db.cursor() as cursor:
+            cursor.execute(
+                "SELECT id FROM categories WHERE id = %s",
+                (category_id,)
+            )
+            if not cursor.fetchone():
+                return error_response('Category not found', 404)
+            
+            cursor.execute(
+                "UPDATE categories SET is_active = %s WHERE id = %s",
+                (is_active, category_id)
+            )
+            db.commit()
+            
+            cursor.execute(
+                "SELECT id, name, is_active, created_at FROM categories WHERE id = %s",
+                (category_id,)
+            )
+            category = cursor.fetchone()
         
         return jsonify(format_category(category)), 200
         
     except Exception as e:
+        db.rollback()
         return handle_db_error(e)
 
 
@@ -235,7 +244,7 @@ def update_category_status(category_id):
 def delete_category(category_id):
     """
     DELETE /categories/<uuid>
-    Soft deletes a category by setting is_active = 0.
+    Soft deletes a category by setting is_active = false.
     
     Returns:
         200: Success message
@@ -249,27 +258,29 @@ def delete_category(category_id):
     
     db = get_db()
     try:
-        # Check if category exists and get current status
-        cursor = db.execute(
-            "SELECT id, is_active FROM categories WHERE id = ?",
-            (category_id,)
-        )
-        category = cursor.fetchone()
-        
-        if not category:
-            return error_response('Category not found', 404)
-        
-        if category['is_active'] == 0:
-            return error_response('Category is already deleted', 400)
-        
-        # Soft delete - set is_active to 0
-        db.execute(
-            "UPDATE categories SET is_active = 0 WHERE id = ?",
-            (category_id,)
-        )
-        db.commit()
+        with db.cursor() as cursor:
+            # Check if category exists and get current status
+            cursor.execute(
+                "SELECT id, is_active FROM categories WHERE id = %s",
+                (category_id,)
+            )
+            category = cursor.fetchone()
+            
+            if not category:
+                return error_response('Category not found', 404)
+            
+            if category['is_active'] == False:
+                return error_response('Category is already deleted', 400)
+            
+            # Soft delete - set is_active to false
+            cursor.execute(
+                "UPDATE categories SET is_active = FALSE WHERE id = %s",
+                (category_id,)
+            )
+            db.commit()
         
         return jsonify({'message': 'Category deleted successfully'}), 200
         
     except Exception as e:
+        db.rollback()
         return handle_db_error(e)

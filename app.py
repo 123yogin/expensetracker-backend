@@ -1,17 +1,22 @@
 """
 Personal Expense Tracker API
-Flask REST API with SQLite backend.
+Flask REST API with PostgreSQL backend.
 
 Production-hardened version:
 - Debug mode disabled
 - CORS restricted to frontend origin
 - Centralized error handling
 - Database connection management via Flask g context
+- Idempotent database initialization (tables created on startup if not exist)
 """
 
 import os
 from flask import Flask, jsonify
 from flask_cors import CORS
+from dotenv import load_dotenv
+
+# Load environment variables from .env file (for local development)
+load_dotenv()
 
 from database import init_db, init_app as init_db_app
 from errors import register_error_handlers

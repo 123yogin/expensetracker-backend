@@ -1,34 +1,51 @@
 """
 Database connection and initialization module.
-Handles SQLite connection with foreign key support.
+Handles PostgreSQL connection with connection pooling.
 
 Production-hardened version:
 - Uses Flask g context for per-request connections
-- Ensures PRAGMA foreign_keys = ON on every connection
+- Loads credentials from environment variables
 - Proper connection cleanup with teardown_appcontext
+- Idempotent table creation (safe to run multiple times)
 """
 
-import sqlite3
 import os
-from flask import g, current_app
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from flask import g
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 
-DATABASE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'expense_tracker.db')
+def get_database_url():
+    """
+    Get database URL from environment variable.
+    Render provides DATABASE_URL automatically for linked databases.
+    """
+    database_url = os.environ.get('DATABASE_URL')
+    
+    if not database_url:
+        raise RuntimeError("DATABASE_URL environment variable is not set")
+    
+    # Render uses 'postgres://' but psycopg2 requires 'postgresql://'
+    if database_url.startswith('postgres://'):
+        database_url = database_url.replace('postgres://', 'postgresql://', 1)
+    
+    return database_url
 
 
 def get_db():
     """
     Get a database connection from Flask g context.
     Creates a new connection if one doesn't exist for this request.
-    
-    IMPORTANT: This ensures a single connection per request,
-    and foreign keys are enabled on every new connection.
     """
     if 'db' not in g:
-        g.db = sqlite3.connect(DATABASE_PATH)
-        g.db.row_factory = sqlite3.Row  # Return rows as dictionaries
-        # CRITICAL: Enable foreign key constraints on EVERY connection
-        g.db.execute("PRAGMA foreign_keys = ON")
+        g.db = psycopg2.connect(
+            get_database_url(),
+            cursor_factory=RealDictCursor  # Return rows as dictionaries
+        )
     return g.db
 
 
@@ -44,27 +61,56 @@ def close_db(e=None):
 
 def init_db():
     """
-    Initialize the database by executing the schema.sql file.
-    Creates tables and indexes if they don't exist.
+    Initialize the database by creating tables if they don't exist.
+    This is IDEMPOTENT - safe to run multiple times.
     
-    NOTE: This runs outside of request context, so we create
-    a standalone connection here.
+    Uses 'CREATE TABLE IF NOT EXISTS' and 'CREATE INDEX IF NOT EXISTS'
+    to ensure tables are only created if missing.
     """
-    schema_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'schema.sql')
+    # Inline schema for idempotent table creation
+    schema = """
+    -- Categories Table (idempotent creation)
+    CREATE TABLE IF NOT EXISTS categories (
+        id TEXT PRIMARY KEY,
+        name TEXT UNIQUE NOT NULL,
+        is_active BOOLEAN DEFAULT TRUE,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    -- Expenses Table (idempotent creation)
+    CREATE TABLE IF NOT EXISTS expenses (
+        id TEXT PRIMARY KEY,
+        date DATE NOT NULL,
+        amount DECIMAL(10,2) NOT NULL,
+        category_id TEXT NOT NULL REFERENCES categories(id),
+        note TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP
+    );
+
+    -- Indexes for faster queries (idempotent creation)
+    CREATE INDEX IF NOT EXISTS idx_expenses_date ON expenses(date);
+    CREATE INDEX IF NOT EXISTS idx_expenses_category_id ON expenses(category_id);
+    """
     
-    conn = sqlite3.connect(DATABASE_PATH)
-    conn.execute("PRAGMA foreign_keys = ON")
+    conn = None
     try:
-        with open(schema_path, 'r') as f:
-            schema = f.read()
-        conn.executescript(schema)
+        conn = psycopg2.connect(get_database_url())
+        with conn.cursor() as cur:
+            cur.execute(schema)
         conn.commit()
-        print("Database initialized successfully.")
+        print("✅ Database tables initialized successfully (idempotent).")
+    except psycopg2.OperationalError as e:
+        print(f"❌ Database connection error: {e}")
+        raise
     except Exception as e:
-        print(f"Error initializing database: {e}")
+        if conn:
+            conn.rollback()
+        print(f"❌ Error initializing database: {e}")
         raise
     finally:
-        conn.close()
+        if conn:
+            conn.close()
 
 
 def init_app(app):
