@@ -52,6 +52,7 @@ def monthly_summary():
                 """SELECT 
                        COUNT(*) as transaction_count,
                        COALESCE(SUM(amount), 0) as total_amount,
+                       COALESCE(SUM(split_amount), 0) as total_split,
                        COALESCE(AVG(amount), 0) as average_amount,
                        COALESCE(MIN(amount), 0) as min_amount,
                        COALESCE(MAX(amount), 0) as max_amount
@@ -74,8 +75,13 @@ def monthly_summary():
             
             # Helper to safely convert to Decimal
             total_expense = Decimal(str(expense_row['total_amount'])) if expense_row['total_amount'] else Decimal('0')
+            total_split = Decimal(str(expense_row['total_split'])) if expense_row['total_split'] else Decimal('0')
             total_income = Decimal(str(income_row['total_amount'])) if income_row['total_amount'] else Decimal('0')
-            net_balance = total_income - total_expense
+            
+            # Net balance considering split money as "not spent" or "incoming"
+            # Actual net balance = Income - Exp (where Exp is net out of pocket)
+            net_spending = total_expense - total_split
+            net_balance = total_income - net_spending
             savings_rate = (net_balance / total_income * 100) if total_income > 0 else Decimal('0')
 
         return jsonify({
@@ -84,6 +90,8 @@ def monthly_summary():
             'end_date': end_date,
             'expense_count': expense_row['transaction_count'],
             'total_expense': format_amount(total_expense),
+            'total_owed': format_amount(total_split),
+            'net_spending': format_amount(net_spending),
             'average_expense': format_amount(expense_row['average_amount']),
             'min_expense': format_amount(expense_row['min_amount']),
             'max_expense': format_amount(expense_row['max_amount']),

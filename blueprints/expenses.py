@@ -40,6 +40,9 @@ def format_expense(row) -> dict:
         'category_id': str(row['category_id']),
         'category_name': row['category_name'],
         'note': row['note'],
+        'is_split': row['is_split'],
+        'split_amount': format_amount(row['split_amount']),
+        'split_with': row['split_with'],
         'created_at': str(row['created_at']) if row['created_at'] else None,
         'updated_at': str(row['updated_at']) if row['updated_at'] else None
     }
@@ -48,6 +51,7 @@ def format_expense(row) -> dict:
 # SQL query for fetching expense with category name (reusable)
 EXPENSE_SELECT_QUERY = """
     SELECT e.id, e.date, e.amount, e.category_id, e.note,
+           e.is_split, e.split_amount, e.split_with,
            e.created_at, e.updated_at, c.name as category_name
     FROM expenses e
     JOIN categories c ON e.category_id = c.id
@@ -179,11 +183,21 @@ def create_expense():
             if not cursor.fetchone():
                 return error_response('Category not found or inactive', 404)
             
-            # Insert expense with validated amount as string (stored as DECIMAL)
+            # Split fields
+            is_split = bool(data.get('is_split', False))
+            split_amount = 0
+            split_with = data.get('split_with', '')
+
+            if is_split:
+                split_amount, error = validate_amount(data.get('split_amount', 0))
+                if error:
+                    return error_response(f'Invalid split_amount: {error}', 400)
+            
+            # Insert expense with validated amount
             cursor.execute(
-                """INSERT INTO expenses (id, date, amount, category_id, note)
-                   VALUES (%s, %s, %s, %s, %s)""",
-                (expense_id, date, str(validated_amount), category_id, note)
+                """INSERT INTO expenses (id, date, amount, category_id, note, is_split, split_amount, split_with)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+                (expense_id, date, str(validated_amount), category_id, note, is_split, str(split_amount), split_with)
             )
             db.commit()
             
@@ -289,6 +303,22 @@ def update_expense(expense_id):
                     return error_response('Note must be 500 characters or less', 400)
                 updates.append("note = %s")
                 params.append(note)
+
+            if 'is_split' in data:
+                is_split = bool(data['is_split'])
+                updates.append("is_split = %s")
+                params.append(is_split)
+            
+            if 'split_amount' in data:
+                s_amount, error = validate_amount(data['split_amount'])
+                if error:
+                    return error_response(f'Invalid split_amount: {error}', 400)
+                updates.append("split_amount = %s")
+                params.append(str(s_amount))
+            
+            if 'split_with' in data:
+                updates.append("split_with = %s")
+                params.append(data['split_with'])
             
             if not updates:
                 return error_response('No fields to update', 400)

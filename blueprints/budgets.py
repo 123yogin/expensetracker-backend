@@ -175,7 +175,7 @@ def get_budget_status():
             
             # Get actual spending for the month grouped by category
             cursor.execute("""
-                SELECT category_id, COALESCE(SUM(amount), 0) as spent_amount
+                SELECT category_id, COALESCE(SUM(amount - split_amount), 0) as spent_amount
                 FROM expenses
                 WHERE date >= %s AND date <= %s
                 GROUP BY category_id

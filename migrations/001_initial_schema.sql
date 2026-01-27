@@ -1,6 +1,6 @@
--- SQL Schema for Personal Expense Tracker (PostgreSQL)
+-- Migration 001: Initial Schema
+-- Includes categories, expenses, income, budgets, and recurring_expenses
 
--- Categories Table
 CREATE TABLE IF NOT EXISTS categories (
     id UUID PRIMARY KEY,
     name TEXT UNIQUE NOT NULL,
@@ -8,25 +8,19 @@ CREATE TABLE IF NOT EXISTS categories (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
--- Expenses Table
 CREATE TABLE IF NOT EXISTS expenses (
     id UUID PRIMARY KEY,
     date DATE NOT NULL,
     amount DECIMAL(10,2) NOT NULL,
     category_id UUID NOT NULL REFERENCES categories(id),
     note TEXT,
-    is_split BOOLEAN DEFAULT FALSE,
-    split_amount DECIMAL(10,2) DEFAULT 0.00,
-    split_with TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP
 );
 
--- Index for faster queries on expenses
 CREATE INDEX IF NOT EXISTS idx_expenses_date ON expenses(date);
 CREATE INDEX IF NOT EXISTS idx_expenses_category_id ON expenses(category_id);
 
--- Income Table
 CREATE TABLE IF NOT EXISTS income (
     id UUID PRIMARY KEY,
     date DATE NOT NULL,
@@ -37,10 +31,8 @@ CREATE TABLE IF NOT EXISTS income (
     updated_at TIMESTAMP
 );
 
-
 CREATE INDEX IF NOT EXISTS idx_income_date ON income(date);
 
--- Budgets Table (Global per category)
 CREATE TABLE IF NOT EXISTS budgets (
     id UUID PRIMARY KEY,
     category_id UUID UNIQUE NOT NULL REFERENCES categories(id) ON DELETE CASCADE,
@@ -51,7 +43,6 @@ CREATE TABLE IF NOT EXISTS budgets (
 
 CREATE INDEX IF NOT EXISTS idx_budgets_category_id ON budgets(category_id);
 
--- Recurring Expenses Table (for automated/reminder bills)
 CREATE TABLE IF NOT EXISTS recurring_expenses (
     id UUID PRIMARY KEY,
     title TEXT NOT NULL,

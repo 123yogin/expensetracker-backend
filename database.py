@@ -61,92 +61,65 @@ def close_db(e=None):
 
 def init_db():
     """
-    Initialize the database by creating tables if they don't exist.
+    Initialize the database by running all pending migrations.
     This is IDEMPOTENT - safe to run multiple times.
     
-    Uses 'CREATE TABLE IF NOT EXISTS' and 'CREATE INDEX IF NOT EXISTS'
-    to ensure tables are only created if missing.
+    Tracks applied migrations in a 'schema_migrations' table.
     """
-    # Inline schema for idempotent table creation
-    schema = """
-    -- Categories Table (idempotent creation)
-    CREATE TABLE IF NOT EXISTS categories (
-        id UUID PRIMARY KEY,
-        name TEXT UNIQUE NOT NULL,
-        is_active BOOLEAN DEFAULT TRUE,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
-
-    -- Expenses Table (idempotent creation)
-    CREATE TABLE IF NOT EXISTS expenses (
-        id UUID PRIMARY KEY,
-        date DATE NOT NULL,
-        amount DECIMAL(10,2) NOT NULL,
-        category_id UUID NOT NULL REFERENCES categories(id),
-        note TEXT,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP
-    );
-
-    -- Indexes for faster queries (idempotent creation)
-    CREATE INDEX IF NOT EXISTS idx_expenses_date ON expenses(date);
-    CREATE INDEX IF NOT EXISTS idx_expenses_category_id ON expenses(category_id);
-
-    -- Income Table (idempotent creation)
-    CREATE TABLE IF NOT EXISTS income (
-        id UUID PRIMARY KEY,
-        date DATE NOT NULL,
-        amount DECIMAL(10,2) NOT NULL,
-        source TEXT NOT NULL,
-        description TEXT,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_income_date ON income(date);
-
-    -- Budgets Table (idempotent creation)
-    CREATE TABLE IF NOT EXISTS budgets (
-        id UUID PRIMARY KEY,
-        category_id UUID UNIQUE NOT NULL REFERENCES categories(id) ON DELETE CASCADE,
-        amount DECIMAL(10,2) NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_budgets_category_id ON budgets(category_id);
-
-    -- Recurring Expenses Table (idempotent creation)
-    CREATE TABLE IF NOT EXISTS recurring_expenses (
-        id UUID PRIMARY KEY,
-        title TEXT NOT NULL,
-        amount DECIMAL(10,2) NOT NULL,
-        category_id UUID REFERENCES categories(id) ON DELETE SET NULL,
-        frequency TEXT NOT NULL,
-        next_date DATE NOT NULL,
-        note TEXT,
-        is_active BOOLEAN DEFAULT TRUE,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_recurring_next_date ON recurring_expenses(next_date);
-    """
-    
     conn = None
     try:
         conn = psycopg2.connect(get_database_url())
         with conn.cursor() as cur:
-            cur.execute(schema)
-        conn.commit()
-        print("✅ Database tables initialized successfully (idempotent).")
+            # 1. Create migrations tracker table if it doesn't exist
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS schema_migrations (
+                    id SERIAL PRIMARY KEY,
+                    filename TEXT UNIQUE NOT NULL,
+                    applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+            
+            # 2. Get list of already applied migrations
+            cur.execute("SELECT filename FROM schema_migrations")
+            applied_migrations = {row['filename'] for row in cur.fetchall()}
+            
+            # 3. Read migration files from folder
+            migrations_dir = os.path.join(os.path.dirname(__file__), 'migrations')
+            if not os.path.exists(migrations_dir):
+                print(f"⚠️ Migrations directory not found: {migrations_dir}")
+                return
+
+            migration_files = sorted([f for f in os.listdir(migrations_dir) if f.endswith('.sql')])
+            
+            # 4. Apply pending migrations
+            applied_count = 0
+            for filename in migration_files:
+                if filename not in applied_migrations:
+                    print(f"🚀 Applying migration: {filename}...")
+                    with open(os.path.join(migrations_dir, filename), 'r') as f:
+                        sql = f.read()
+                        if sql.strip():
+                            cur.execute(sql)
+                    
+                    cur.execute(
+                        "INSERT INTO schema_migrations (filename) VALUES (%s)",
+                        (filename,)
+                    )
+                    applied_count += 1
+            
+            conn.commit()
+            if applied_count > 0:
+                print(f"✅ Successfully applied {applied_count} new migrations.")
+            else:
+                print("✅ Database is up to date. No new migrations applied.")
+                
     except psycopg2.OperationalError as e:
         print(f"❌ Database connection error: {e}")
         raise
     except Exception as e:
         if conn:
             conn.rollback()
-        print(f"❌ Error initializing database: {e}")
+        print(f"❌ Error during database migration: {e}")
         raise
     finally:
         if conn:
