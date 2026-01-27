@@ -69,7 +69,7 @@ def init_db():
     conn = None
     try:
         conn = psycopg2.connect(get_database_url())
-        with conn.cursor() as cur:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
             # 1. Create migrations tracker table if it doesn't exist
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -81,7 +81,15 @@ def init_db():
             
             # 2. Get list of already applied migrations
             cur.execute("SELECT filename FROM schema_migrations")
-            applied_migrations = {row['filename'] for row in cur.fetchall()}
+            rows = cur.fetchall()
+            
+            # Handle both tuple and dict responses
+            applied_migrations = set()
+            for row in rows:
+                if isinstance(row, dict):
+                    applied_migrations.add(row['filename'])
+                elif isinstance(row, (tuple, list)) and len(row) > 0:
+                    applied_migrations.add(row[0])
             
             # 3. Read migration files from folder
             migrations_dir = os.path.join(os.path.dirname(__file__), 'migrations')
@@ -115,6 +123,8 @@ def init_db():
                 
     except psycopg2.OperationalError as e:
         print(f"❌ Database connection error: {e}")
+        print("💡 Make sure PostgreSQL is running and the database exists.")
+        print("💡 Check your DATABASE_URL in the .env file.")
         raise
     except Exception as e:
         if conn:
