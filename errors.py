@@ -11,7 +11,8 @@ Production-hardened error responses:
 import logging
 from functools import wraps
 from flask import jsonify
-import sqlite3
+import psycopg2
+from psycopg2 import errors as pg_errors
 
 # Configure logging
 logging.basicConfig(
@@ -67,34 +68,25 @@ def error_response(message: str, status_code: int = 400):
 def handle_db_error(e: Exception):
     """
     Handle database errors gracefully.
-    Logs the actual error for debugging while returning safe message to user.
-    
-    Args:
-        e: The caught exception
-        
-    Returns:
-        Tuple of (response, status_code)
     """
     error_str = str(e)
     
-    # Handle specific SQLite errors
-    if isinstance(e, sqlite3.IntegrityError):
-        if 'UNIQUE constraint failed' in error_str:
-            return error_response("A record with this value already exists", 409)
-        if 'FOREIGN KEY constraint failed' in error_str:
-            return error_response("Referenced record does not exist", 400)
-        if 'NOT NULL constraint failed' in error_str:
-            return error_response("Required field is missing", 400)
-        logger.warning(f"IntegrityError: {error_str}")
-        return error_response("Database constraint violation", 400)
+    # Handle specific PostgreSQL errors via psycopg2
+    if isinstance(e, pg_errors.UniqueViolation):
+        logger.warning(f"UniqueViolation: {error_str}")
+        return error_response("A record with this value already exists", 409)
     
-    if isinstance(e, sqlite3.OperationalError):
-        logger.error(f"OperationalError: {error_str}")
-        return error_response("Database operation failed", 500)
+    if isinstance(e, pg_errors.ForeignKeyViolation):
+        logger.warning(f"ForeignKeyViolation: {error_str}")
+        return error_response("Referenced record does not exist", 400)
     
-    if isinstance(e, sqlite3.DatabaseError):
-        logger.error(f"DatabaseError: {error_str}")
-        return error_response("Database error occurred", 500)
+    if isinstance(e, pg_errors.NotNullViolation):
+        logger.warning(f"NotNullViolation: {error_str}")
+        return error_response("Required field is missing", 400)
+    
+    if isinstance(e, (psycopg2.OperationalError, psycopg2.DatabaseError)):
+        logger.error(f"Database Error: {error_str}")
+        return error_response(f"Database Error: {error_str}", 500)
     
     # Generic error - log it but don't expose details
     logger.error(f"Unexpected error: {type(e).__name__}: {error_str}")

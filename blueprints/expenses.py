@@ -34,10 +34,10 @@ def format_expense(row) -> dict:
     Note: amount is returned as string to preserve precision.
     """
     return {
-        'id': row['id'],
+        'id': str(row['id']),
         'date': str(row['date']) if row['date'] else None,
         'amount': format_amount(row['amount']),
-        'category_id': row['category_id'],
+        'category_id': str(row['category_id']),
         'category_name': row['category_name'],
         'note': row['note'],
         'created_at': str(row['created_at']) if row['created_at'] else None,

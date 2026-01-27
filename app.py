@@ -23,6 +23,9 @@ from errors import register_error_handlers
 from blueprints.categories import categories_bp
 from blueprints.expenses import expenses_bp
 from blueprints.reports import reports_bp
+from blueprints.income import income_bp
+from blueprints.budgets import budgets_bp
+from blueprints.recurring_expenses import recurring_bp
 
 
 # Frontend origins - configure for your deployment
@@ -63,6 +66,9 @@ def create_app(testing: bool = False):
     app.register_blueprint(categories_bp)
     app.register_blueprint(expenses_bp)
     app.register_blueprint(reports_bp)
+    app.register_blueprint(income_bp)
+    app.register_blueprint(budgets_bp)
+    app.register_blueprint(recurring_bp)
     
     # Health check endpoint
     @app.route('/health', methods=['GET'])

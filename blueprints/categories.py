@@ -24,7 +24,7 @@ def format_category(row) -> dict:
     Helper function to eliminate code duplication.
     """
     return {
-        'id': row['id'],
+        'id': str(row['id']),
         'name': row['name'],
         'is_active': bool(row['is_active']),
         'created_at': str(row['created_at']) if row['created_at'] else None
@@ -280,6 +280,60 @@ def delete_category(category_id):
             db.commit()
         
         return jsonify({'message': 'Category deleted successfully'}), 200
+        
+    except Exception as e:
+        db.rollback()
+        return handle_db_error(e)
+
+
+@categories_bp.route('/seed', methods=['POST'])
+def seed_categories():
+    """
+    POST /categories/seed
+    Seeds default Indian categories if they don't exist.
+    """
+    INDIAN_CATEGORIES = [
+        "Groceries (Sabzi Mandi)",
+        "Transportation (Auto/Bus)",
+        "Food & Dining",
+        "Education (Fees/Books)",
+        "Medical (Doctor/Medicine)",
+        "Utilities (Electricity/Water)",
+        "Household (Maid/Maintenance)",
+        "Shopping",
+        "Entertainment (Movies/OTT)",
+        "Festivals/Religious",
+        "Mobile/Internet Recharge",
+        "Personal Care"
+    ]
+    
+    db = get_db()
+    added_count = 0
+    skipped_count = 0
+    
+    try:
+        with db.cursor() as cursor:
+            for name in INDIAN_CATEGORIES:
+                # Check if exists
+                cursor.execute("SELECT id FROM categories WHERE name = %s", (name,))
+                if cursor.fetchone():
+                    skipped_count += 1
+                    continue
+                    
+                cat_id = generate_uuid()
+                cursor.execute(
+                    "INSERT INTO categories (id, name, is_active) VALUES (%s, %s, TRUE)",
+                    (cat_id, name)
+                )
+                added_count += 1
+            
+            db.commit()
+            
+        return jsonify({
+            'message': f'Seeding complete. Added: {added_count}, Skipped: {skipped_count}',
+            'added': added_count,
+            'skipped': skipped_count
+        }), 201
         
     except Exception as e:
         db.rollback()
