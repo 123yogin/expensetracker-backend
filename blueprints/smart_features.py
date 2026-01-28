@@ -430,8 +430,8 @@ def export_csv():
     """
     data = request.get_json() or {}
     
-    start_date = data.get('start_date')
-    end_date = data.get('end_date')
+    start_date = data.get('start_date') or None
+    end_date = data.get('end_date') or None
     category_ids = data.get('category_ids', [])
     
     try:
@@ -521,6 +521,147 @@ def export_csv():
             
     except Exception as e:
         return handle_db_error(e, "Failed to export CSV")
+
+@smart_bp.route('/export/pdf', methods=['POST'])
+def export_pdf():
+    """
+    POST /smart/export/pdf
+    Export expenses to PDF format.
+    
+    Body:
+        start_date: string (optional) - YYYY-MM-DD
+        end_date: string (optional) - YYYY-MM-DD
+        category_ids: array (optional) - filter by categories
+    
+    Returns:
+        200: PDF file download
+        400: Validation error
+    """
+    data = request.get_json() or {}
+    
+    start_date = data.get('start_date') or None
+    end_date = data.get('end_date') or None
+    category_ids = data.get('category_ids', [])
+    
+    try:
+        # Lazy import reportlab to allow app startup if missing (though it should be installed)
+        from reportlab.lib import colors
+        from reportlab.lib.pagesizes import letter
+        from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        
+        db = get_db()
+        with db.cursor(cursor_factory=RealDictCursor) as cursor:
+            # Re-use the same query logic as CSV export
+            query = """
+                SELECT e.date, e.amount, c.name as category, e.note,
+                       e.is_split, e.split_amount
+                FROM expenses e
+                JOIN categories c ON e.category_id = c.id
+                WHERE 1=1
+            """
+            params = []
+            
+            if start_date:
+                query += " AND e.date >= %s"
+                params.append(start_date)
+            
+            if end_date:
+                query += " AND e.date <= %s"
+                params.append(end_date)
+            
+            if category_ids:
+                placeholders = ','.join(['%s'] * len(category_ids))
+                query += f" AND e.category_id IN ({placeholders})"
+                params.extend(category_ids)
+            
+            query += " ORDER BY e.date DESC, e.created_at DESC"
+            
+            cursor.execute(query, params)
+            expenses = cursor.fetchall()
+            
+            # Create PDF Buffer
+            buffer = io.BytesIO()
+            doc = SimpleDocTemplate(buffer, pagesize=letter)
+            elements = []
+            
+            # Styles
+            styles = getSampleStyleSheet()
+            title_style = styles['Title']
+            
+            # Title
+            title_text = "Expense Report"
+            if start_date and end_date:
+                title_text += f" ({start_date} to {end_date})"
+            elements.append(Paragraph(title_text, title_style))
+            elements.append(Spacer(1, 20))
+            
+            # Table Data
+            table_data = [['Date', 'Category', 'Note', 'Amount', 'Split?']]
+            
+            total_amount = 0
+            
+            for exp in expenses:
+                amount = float(exp['amount'])
+                total_amount += amount
+                
+                note = exp['note'] or ''
+                if len(note) > 20:
+                    note = note[:17] + '...'
+                    
+                table_data.append([
+                    str(exp['date']),
+                    exp['category'],
+                    note,
+                    f"₹{format_amount(amount)}",
+                    'Yes' if exp['is_split'] else 'No'
+                ])
+            
+            # Add Total Row
+            table_data.append(['', '', 'Total', f"₹{format_amount(total_amount)}", ''])
+            
+            # Table Formatting
+            table = Table(table_data, colWidths=[80, 100, 180, 80, 50])
+            table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+                ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+                ('GRID', (0, 0), (-1, -2), 1, colors.black),
+                ('FONTNAME', (0, -1), (-1, -1), 'Helvetica-Bold'), # Total row bold
+                ('LINEABOVE', (0, -1), (-1, -1), 2, colors.black), # Line above total
+            ]))
+            
+            elements.append(table)
+            
+            # Build PDF
+            doc.build(elements)
+            
+            # Log export
+            export_id = generate_uuid()
+            cursor.execute("""
+                INSERT INTO export_logs (id, export_type, date_range_start, date_range_end, total_records)
+                VALUES (%s, 'pdf', %s, %s, %s)
+            """, (export_id, start_date, end_date, len(expenses)))
+            db.commit()
+            
+            # Return file
+            buffer.seek(0)
+            filename = f"expenses_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+            
+            return send_file(
+                buffer,
+                mimetype='application/pdf',
+                as_attachment=True,
+                download_name=filename
+            )
+
+    except ImportError:
+        return error_response("PDF generation library (reportlab) not installed", 500)
+    except Exception as e:
+        return handle_db_error(e, "Failed to export PDF")
 
 @smart_bp.route('/export/summary', methods=['GET'])
 def export_summary():
