@@ -65,31 +65,40 @@ def error_response(message: str, status_code: int = 400):
     return jsonify({'error': message}), status_code
 
 
-def handle_db_error(e: Exception):
+def handle_db_error(e: Exception, context_message: str = None):
     """
     Handle database errors gracefully.
+    
+    Args:
+        e: The exception that occurred
+        context_message: Optional context message for logging (e.g., "Failed to fetch templates")
     """
     error_str = str(e)
+    context = f" - {context_message}" if context_message else ""
     
     # Handle specific PostgreSQL errors via psycopg2
     if isinstance(e, pg_errors.UniqueViolation):
-        logger.warning(f"UniqueViolation: {error_str}")
+        logger.warning(f"UniqueViolation{context}: {error_str}")
         return error_response("A record with this value already exists", 409)
     
     if isinstance(e, pg_errors.ForeignKeyViolation):
-        logger.warning(f"ForeignKeyViolation: {error_str}")
+        logger.warning(f"ForeignKeyViolation{context}: {error_str}")
         return error_response("Referenced record does not exist", 400)
     
     if isinstance(e, pg_errors.NotNullViolation):
-        logger.warning(f"NotNullViolation: {error_str}")
+        logger.warning(f"NotNullViolation{context}: {error_str}")
         return error_response("Required field is missing", 400)
     
     if isinstance(e, (psycopg2.OperationalError, psycopg2.DatabaseError)):
-        logger.error(f"Database Error: {error_str}")
-        return error_response(f"Database Error: {error_str}", 500)
+        logger.error(f"Database Error{context}: {error_str}")
+        # Check if it's a table doesn't exist error
+        if "does not exist" in error_str.lower() or "relation" in error_str.lower():
+            logger.error(f"Table may not exist. Error: {error_str}")
+            return error_response("Database table not found. Please run migrations.", 500)
+        return error_response("Database connection error", 500)
     
     # Generic error - log it but don't expose details
-    logger.error(f"Unexpected error: {type(e).__name__}: {error_str}")
+    logger.error(f"Unexpected error{context}: {type(e).__name__}: {error_str}")
     return error_response("An unexpected error occurred", 500)
 
 

@@ -51,6 +51,31 @@ CREATE TABLE IF NOT EXISTS budgets (
 
 CREATE INDEX IF NOT EXISTS idx_budgets_category_id ON budgets(category_id);
 
+-- Expense Templates Table (for quick entry)
+CREATE TABLE IF NOT EXISTS expense_templates (
+    id UUID PRIMARY KEY,
+    name TEXT NOT NULL,
+    category_id UUID REFERENCES categories(id) ON DELETE CASCADE,
+    default_amount DECIMAL(10,2),
+    note_template TEXT,
+    is_active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_templates_active ON expense_templates(is_active);
+
+-- Quick Shortcuts Table (for dashboard shortcuts)
+CREATE TABLE IF NOT EXISTS quick_shortcuts (
+    id UUID PRIMARY KEY,
+    category_id UUID REFERENCES categories(id) ON DELETE CASCADE,
+    position INTEGER NOT NULL,
+    is_active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_shortcuts_position ON quick_shortcuts(position);
+
 -- Recurring Expenses Table (for automated/reminder bills)
 CREATE TABLE IF NOT EXISTS recurring_expenses (
     id UUID PRIMARY KEY,
