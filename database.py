@@ -94,7 +94,7 @@ def init_db():
             # 3. Read migration files from folder
             migrations_dir = os.path.join(os.path.dirname(__file__), 'migrations')
             if not os.path.exists(migrations_dir):
-                print(f"⚠️ Migrations directory not found: {migrations_dir}")
+                print(f"[WARN] Migrations directory not found: {migrations_dir}")
                 return
 
             migration_files = sorted([f for f in os.listdir(migrations_dir) if f.endswith('.sql')])
@@ -103,7 +103,7 @@ def init_db():
             applied_count = 0
             for filename in migration_files:
                 if filename not in applied_migrations:
-                    print(f"🚀 Applying migration: {filename}...")
+                    print(f"[MIGRATE] Applying migration: {filename}...")
                     with open(os.path.join(migrations_dir, filename), 'r') as f:
                         sql = f.read()
                         if sql.strip():
@@ -117,19 +117,19 @@ def init_db():
             
             conn.commit()
             if applied_count > 0:
-                print(f"✅ Successfully applied {applied_count} new migrations.")
+                print(f"[OK] Successfully applied {applied_count} new migrations.")
             else:
-                print("✅ Database is up to date. No new migrations applied.")
+                print("[OK] Database is up to date. No new migrations applied.")
                 
     except psycopg2.OperationalError as e:
-        print(f"❌ Database connection error: {e}")
-        print("💡 Make sure PostgreSQL is running and the database exists.")
-        print("💡 Check your DATABASE_URL in the .env file.")
+        print(f"[ERROR] Database connection error: {e}")
+        print("[TIP] Make sure PostgreSQL is running and the database exists.")
+        print("[TIP] Check your DATABASE_URL in the .env file.")
         raise
     except Exception as e:
         if conn:
             conn.rollback()
-        print(f"❌ Error during database migration: {e}")
+        print(f"[ERROR] Error during database migration: {e}")
         raise
     finally:
         if conn:

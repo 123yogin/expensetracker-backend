@@ -30,6 +30,10 @@ from blueprints.templates import templates_bp
 from blueprints.smart_features import smart_bp
 from blueprints.groups import groups_bp
 from blueprints.notifications import notifications_bp
+from blueprints.receipts import receipts_bp
+from blueprints.smart_categorization import smart_categorization_bp
+from blueprints.voice import voice_bp
+from blueprints.export import export_bp
 
 
 # Frontend origins - configure for your deployment
@@ -77,6 +81,10 @@ def create_app(testing: bool = False):
     app.register_blueprint(smart_bp)
     app.register_blueprint(groups_bp)
     app.register_blueprint(notifications_bp)
+    app.register_blueprint(receipts_bp)
+    app.register_blueprint(smart_categorization_bp)
+    app.register_blueprint(voice_bp)
+    app.register_blueprint(export_bp)
     
     # Health check endpoint
     @app.route('/health', methods=['GET'])

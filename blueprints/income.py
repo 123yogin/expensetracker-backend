@@ -1,9 +1,13 @@
 """
 Income Blueprint - Handles all income-related API endpoints.
+
+Production-hardened endpoints with USER ISOLATION:
+- AUTHENTICATION REQUIRED: All endpoints require valid JWT
+- USER ISOLATION: Each user can only access their own income records
 """
 
 import psycopg2
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request, jsonify, g
 
 from database import get_db
 from validators import (
@@ -14,6 +18,7 @@ from validators import (
     generate_uuid
 )
 from errors import handle_db_error, error_response
+from auth import require_auth, get_current_user_id
 
 
 income_bp = Blueprint('income', __name__, url_prefix='/income')
@@ -42,10 +47,11 @@ INCOME_SELECT_QUERY = """
 
 
 @income_bp.route('', methods=['GET'])
+@require_auth
 def get_income():
     """
     GET /income
-    List income with optional filters.
+    List income for the authenticated user with optional filters.
     
     Query parameters:
         start_date: YYYY-MM-DD (optional)
@@ -53,16 +59,19 @@ def get_income():
         source: String (optional)
     
     Returns:
-        200: List of income objects
+        200: List of income objects (user's income only)
         400: Validation error
+        401: Unauthorized
     """
+    user_id = get_current_user_id()
+    
     start_date = request.args.get('start_date')
     end_date = request.args.get('end_date')
     source = request.args.get('source')
     
-    # Build query with optional filters
-    query = INCOME_SELECT_QUERY + " WHERE 1=1"
-    params = []
+    # Build query with USER ISOLATION filter
+    query = INCOME_SELECT_QUERY + " WHERE user_id = %s"
+    params = [user_id]
     
     if start_date:
         valid, error = validate_date(start_date, reject_future=False)
@@ -96,10 +105,11 @@ def get_income():
 
 
 @income_bp.route('', methods=['POST'])
+@require_auth
 def create_income():
     """
     POST /income
-    Create a new income entry.
+    Create a new income entry for the authenticated user.
     
     Request body: {
         "date": "YYYY-MM-DD",      (required, cannot be future)
@@ -108,6 +118,7 @@ def create_income():
         "description": "string"     (optional)
     }
     """
+    user_id = get_current_user_id()
     data = request.get_json()
     
     if not data:
@@ -145,16 +156,17 @@ def create_income():
     db = get_db()
     try:
         with db.cursor() as cursor:
+            # Insert with user_id for isolation
             cursor.execute(
-                """INSERT INTO income (id, date, amount, source, description)
-                   VALUES (%s, %s, %s, %s, %s)""",
-                (income_id, date, str(validated_amount), source, description)
+                """INSERT INTO income (id, date, amount, source, description, user_id)
+                   VALUES (%s, %s, %s, %s, %s, %s)""",
+                (income_id, date, str(validated_amount), source, description, user_id)
             )
             db.commit()
             
             cursor.execute(
-                INCOME_SELECT_QUERY + " WHERE id = %s",
-                (income_id,)
+                INCOME_SELECT_QUERY + " WHERE id = %s AND user_id = %s",
+                (income_id, user_id)
             )
             income = cursor.fetchone()
         
@@ -166,11 +178,14 @@ def create_income():
 
 
 @income_bp.route('/<income_id>', methods=['PUT'])
+@require_auth
 def update_income(income_id):
     """
     PUT /income/<uuid>
-    Update an existing income.
+    Update an existing income (must belong to authenticated user).
     """
+    user_id = get_current_user_id()
+    
     valid, error = validate_uuid(income_id)
     if not valid:
         return error_response(f'Invalid income ID: {error}', 400)
@@ -183,8 +198,11 @@ def update_income(income_id):
     db = get_db()
     try:
         with db.cursor() as cursor:
-            # Check if income exists
-            cursor.execute("SELECT id FROM income WHERE id = %s", (income_id,))
+            # Check if income exists AND belongs to user
+            cursor.execute(
+                "SELECT id FROM income WHERE id = %s AND user_id = %s",
+                (income_id, user_id)
+            )
             if not cursor.fetchone():
                 return error_response('Income not found', 404)
             
@@ -228,12 +246,17 @@ def update_income(income_id):
             
             updates.append("updated_at = CURRENT_TIMESTAMP")
             params.append(income_id)
+            params.append(user_id)  # Enforce ownership
             
-            query = f"UPDATE income SET {', '.join(updates)} WHERE id = %s"
+            # Update with ownership enforcement
+            query = f"UPDATE income SET {', '.join(updates)} WHERE id = %s AND user_id = %s"
             cursor.execute(query, params)
             db.commit()
             
-            cursor.execute(INCOME_SELECT_QUERY + " WHERE id = %s", (income_id,))
+            cursor.execute(
+                INCOME_SELECT_QUERY + " WHERE id = %s AND user_id = %s",
+                (income_id, user_id)
+            )
             income = cursor.fetchone()
         
         return jsonify(format_income(income)), 200
@@ -244,11 +267,14 @@ def update_income(income_id):
 
 
 @income_bp.route('/<income_id>', methods=['DELETE'])
+@require_auth
 def delete_income(income_id):
     """
     DELETE /income/<uuid>
-    Delete an income entry.
+    Delete an income entry (must belong to authenticated user).
     """
+    user_id = get_current_user_id()
+    
     valid, error = validate_uuid(income_id)
     if not valid:
         return error_response(f'Invalid income ID: {error}', 400)
@@ -256,11 +282,19 @@ def delete_income(income_id):
     db = get_db()
     try:
         with db.cursor() as cursor:
-            cursor.execute("SELECT id FROM income WHERE id = %s", (income_id,))
+            # Check ownership
+            cursor.execute(
+                "SELECT id FROM income WHERE id = %s AND user_id = %s",
+                (income_id, user_id)
+            )
             if not cursor.fetchone():
                 return error_response('Income not found', 404)
             
-            cursor.execute("DELETE FROM income WHERE id = %s", (income_id,))
+            # Delete with ownership enforcement
+            cursor.execute(
+                "DELETE FROM income WHERE id = %s AND user_id = %s",
+                (income_id, user_id)
+            )
             db.commit()
         
         return jsonify({'message': 'Income deleted successfully'}), 200

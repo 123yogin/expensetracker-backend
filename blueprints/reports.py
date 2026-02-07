@@ -1,43 +1,34 @@
 """
 Reports Blueprint - Handles all report-related API endpoints.
 
-Production-hardened endpoints:
-- Strict month format validation
-- Aggregation done in SQL (not Python) for performance
-- Flask g context for database connections
-- Proper error handling without leaking stack traces
+Production-hardened endpoints with USER ISOLATION:
+- AUTHENTICATION REQUIRED: All endpoints require valid JWT
+- USER ISOLATION: Each user only sees reports for their own data
 """
 
 from decimal import Decimal
 from datetime import date, datetime, timedelta
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request, jsonify, g
 
 from database import get_db
 from validators import validate_month, format_amount, get_month_date_range
 from errors import handle_db_error, error_response
+from auth import require_auth, get_current_user_id
 
 
 reports_bp = Blueprint('reports', __name__, url_prefix='/reports')
 
 
 @reports_bp.route('/monthly-summary', methods=['GET'])
+@require_auth
 def monthly_summary():
     """
     GET /reports/monthly-summary?month=YYYY-MM
-    Returns aggregate expense statistics for the month.
-    
-    All aggregation is performed in SQL for optimal performance.
-    
-    Query parameters:
-        month: YYYY-MM format (required)
-    
-    Returns:
-        200: Monthly summary object with totals and statistics
-        400: Invalid month format
+    Returns aggregate expense statistics for the authenticated user's data.
     """
+    user_id = get_current_user_id()
     month = request.args.get('month')
     
-    # Validate month format
     valid, error = validate_month(month)
     if not valid:
         return error_response(error, 400)
@@ -47,7 +38,7 @@ def monthly_summary():
     db = get_db()
     try:
         with db.cursor() as cursor:
-            # Single SQL query for all aggregations (no N+1 queries)
+            # User's expense aggregations
             cursor.execute(
                 """SELECT 
                        COUNT(*) as transaction_count,
@@ -57,29 +48,26 @@ def monthly_summary():
                        COALESCE(MIN(amount), 0) as min_amount,
                        COALESCE(MAX(amount), 0) as max_amount
                    FROM expenses
-                   WHERE date >= %s AND date <= %s""",
-                (start_date, end_date)
+                   WHERE date >= %s AND date <= %s AND user_id = %s""",
+                (start_date, end_date, user_id)
             )
             expense_row = cursor.fetchone()
 
-            # Get income stats
+            # User's income stats
             cursor.execute(
                 """SELECT 
                        COUNT(*) as transaction_count,
                        COALESCE(SUM(amount), 0) as total_amount
                    FROM income
-                   WHERE date >= %s AND date <= %s""",
-                (start_date, end_date)
+                   WHERE date >= %s AND date <= %s AND user_id = %s""",
+                (start_date, end_date, user_id)
             )
             income_row = cursor.fetchone()
             
-            # Helper to safely convert to Decimal
             total_expense = Decimal(str(expense_row['total_amount'])) if expense_row['total_amount'] else Decimal('0')
             total_split = Decimal(str(expense_row['total_split'])) if expense_row['total_split'] else Decimal('0')
             total_income = Decimal(str(income_row['total_amount'])) if income_row['total_amount'] else Decimal('0')
             
-            # Net balance considering split money as "not spent" or "incoming"
-            # Actual net balance = Income - Exp (where Exp is net out of pocket)
             net_spending = total_expense - total_split
             net_balance = total_income - net_spending
             savings_rate = (net_balance / total_income * 100) if total_income > 0 else Decimal('0')
@@ -106,25 +94,15 @@ def monthly_summary():
 
 
 @reports_bp.route('/category-breakdown', methods=['GET'])
+@require_auth
 def category_breakdown():
     """
     GET /reports/category-breakdown?month=YYYY-MM
-    Returns expenses grouped by category for the month.
-    
-    Uses a single SQL query with LEFT JOIN and GROUP BY
-    to avoid N+1 query problems. Percentages calculated in Python
-    only after aggregation is complete.
-    
-    Query parameters:
-        month: YYYY-MM format (required)
-    
-    Returns:
-        200: Category breakdown with totals and percentages
-        400: Invalid month format
+    Returns expenses grouped by category for the authenticated user.
     """
+    user_id = get_current_user_id()
     month = request.args.get('month')
     
-    # Validate month format
     valid, error = validate_month(month)
     if not valid:
         return error_response(error, 400)
@@ -134,18 +112,17 @@ def category_breakdown():
     db = get_db()
     try:
         with db.cursor() as cursor:
-            # Single query to get total for percentage calculation
+            # Total for user's expenses
             cursor.execute(
                 """SELECT COALESCE(SUM(amount), 0) as total
                    FROM expenses
-                   WHERE date >= %s AND date <= %s""",
-                (start_date, end_date)
+                   WHERE date >= %s AND date <= %s AND user_id = %s""",
+                (start_date, end_date, user_id)
             )
             total_row = cursor.fetchone()
             total_amount = Decimal(str(total_row['total'])) if total_row['total'] else Decimal('0')
             
-            # Single query with LEFT JOIN and GROUP BY (aggregation in SQL)
-            # This avoids N+1 queries - we get all categories with their totals at once
+            # Category breakdown for user
             cursor.execute(
                 """SELECT 
                        c.id as category_id,
@@ -154,15 +131,14 @@ def category_breakdown():
                        COALESCE(SUM(e.amount), 0) as total_amount
                    FROM categories c
                    LEFT JOIN expenses e ON c.id = e.category_id 
-                       AND e.date >= %s AND e.date <= %s
-                   WHERE c.is_active = TRUE
+                       AND e.date >= %s AND e.date <= %s AND e.user_id = %s
+                   WHERE c.is_active = TRUE AND c.user_id = %s
                    GROUP BY c.id, c.name
                    ORDER BY total_amount DESC""",
-                (start_date, end_date)
+                (start_date, end_date, user_id, user_id)
             )
             categories = cursor.fetchall()
         
-        # Build breakdown with percentages (minimal Python processing)
         breakdown = []
         for row in categories:
             cat_amount = Decimal(str(row['total_amount'])) if row['total_amount'] else Decimal('0')
@@ -189,24 +165,15 @@ def category_breakdown():
 
 
 @reports_bp.route('/daily-trend', methods=['GET'])
+@require_auth
 def daily_trend():
     """
     GET /reports/daily-trend?month=YYYY-MM
-    Returns daily expense totals for the month.
-    
-    Aggregation (COUNT, SUM) done in SQL with GROUP BY.
-    Running total calculated in Python after fetching aggregated data.
-    
-    Query parameters:
-        month: YYYY-MM format (required)
-    
-    Returns:
-        200: Daily trend data with running totals
-        400: Invalid month format
+    Returns daily expense totals for the authenticated user.
     """
+    user_id = get_current_user_id()
     month = request.args.get('month')
     
-    # Validate month format
     valid, error = validate_month(month)
     if not valid:
         return error_response(error, 400)
@@ -216,21 +183,19 @@ def daily_trend():
     db = get_db()
     try:
         with db.cursor() as cursor:
-            # Single SQL query with GROUP BY for aggregation (not looping in Python)
             cursor.execute(
                 """SELECT 
                        date,
                        COUNT(*) as transaction_count,
                        SUM(amount) as total_amount
                    FROM expenses
-                   WHERE date >= %s AND date <= %s
+                   WHERE date >= %s AND date <= %s AND user_id = %s
                    GROUP BY date
                    ORDER BY date ASC""",
-                (start_date, end_date)
+                (start_date, end_date, user_id)
             )
             daily_data = cursor.fetchall()
         
-        # Calculate running total (this must be done in order, so Python is appropriate)
         running_total = Decimal('0')
         trend = []
         
@@ -256,13 +221,18 @@ def daily_trend():
         
     except Exception as e:
         return handle_db_error(e)
+
+
 @reports_bp.route('/insights', methods=['GET'])
+@require_auth
 def get_insights():
     """
     GET /reports/insights?month=YYYY-MM
-    Returns projection and comparison insights.
+    Returns projection and comparison insights for the authenticated user.
     """
+    user_id = get_current_user_id()
     month = request.args.get('month')
+    
     valid, error = validate_month(month)
     if not valid:
         return error_response(error, 400)
@@ -270,7 +240,6 @@ def get_insights():
     start_date, end_date = get_month_date_range(month)
     today = date.today()
     
-    # Calculate days in month and days passed
     month_dt = datetime.strptime(month, '%Y-%m')
     import calendar
     days_in_month = calendar.monthrange(month_dt.year, month_dt.month)[1]
@@ -280,35 +249,41 @@ def get_insights():
     elif today > date(month_dt.year, month_dt.month, days_in_month):
         days_passed = days_in_month
     else:
-        days_passed = 1 # Should not happen with valid input but for safety
+        days_passed = 1
         
     db = get_db()
     try:
         with db.cursor() as cursor:
-            # Current month total
-            cursor.execute("SELECT COALESCE(SUM(amount), 0) as total FROM expenses WHERE date >= %s AND date <= %s", (start_date, end_date))
+            # User's current month total
+            cursor.execute(
+                "SELECT COALESCE(SUM(amount), 0) as total FROM expenses WHERE date >= %s AND date <= %s AND user_id = %s",
+                (start_date, end_date, user_id)
+            )
             current_total = Decimal(str(cursor.fetchone()['total']))
             
-            # Previous month total
+            # User's previous month total
             prev_month_dt = month_dt.replace(day=1) - timedelta(days=1)
             prev_month = prev_month_dt.strftime('%Y-%m')
             ps, pe = get_month_date_range(prev_month)
-            cursor.execute("SELECT COALESCE(SUM(amount), 0) as total FROM expenses WHERE date >= %s AND date <= %s", (ps, pe))
+            cursor.execute(
+                "SELECT COALESCE(SUM(amount), 0) as total FROM expenses WHERE date >= %s AND date <= %s AND user_id = %s",
+                (ps, pe, user_id)
+            )
             prev_total = Decimal(str(cursor.fetchone()['total']))
             
-            # Category comparison
+            # Category comparison for user
             cursor.execute("""
                 SELECT 
                     c.name,
                     COALESCE(SUM(CASE WHEN e.date >= %s AND e.date <= %s THEN e.amount ELSE 0 END), 0) as current_amount,
                     COALESCE(SUM(CASE WHEN e.date >= %s AND e.date <= %s THEN e.amount ELSE 0 END), 0) as prev_amount
                 FROM categories c
-                LEFT JOIN expenses e ON c.id = e.category_id
-                WHERE c.is_active = TRUE
+                LEFT JOIN expenses e ON c.id = e.category_id AND e.user_id = %s
+                WHERE c.is_active = TRUE AND c.user_id = %s
                 GROUP BY c.name
                 HAVING SUM(CASE WHEN e.date >= %s AND e.date <= %s THEN e.amount ELSE 0 END) > 0 
                    OR SUM(CASE WHEN e.date >= %s AND e.date <= %s THEN e.amount ELSE 0 END) > 0
-            """, (start_date, end_date, ps, pe, start_date, end_date, ps, pe))
+            """, (start_date, end_date, ps, pe, user_id, user_id, start_date, end_date, ps, pe))
             cat_comparison = cursor.fetchall()
         
         daily_avg = current_total / Decimal(str(days_passed)) if days_passed > 0 else 0
@@ -344,12 +319,15 @@ def get_insights():
     except Exception as e:
         return handle_db_error(e)
 
+
 @reports_bp.route('/trends', methods=['GET'])
+@require_auth
 def get_trends():
     """
     GET /reports/trends?months=6
-    Returns monthly savings trend for the last N months.
+    Returns monthly savings trend for the authenticated user.
     """
+    user_id = get_current_user_id()
     count = request.args.get('months', 6, type=int)
     
     results = []
@@ -362,10 +340,16 @@ def get_trends():
                 month_str = current_date.strftime('%Y-%m')
                 start_date, end_date = get_month_date_range(month_str)
                 
-                cursor.execute("SELECT COALESCE(SUM(amount), 0) as total FROM expenses WHERE date >= %s AND date <= %s", (start_date, end_date))
+                cursor.execute(
+                    "SELECT COALESCE(SUM(amount), 0) as total FROM expenses WHERE date >= %s AND date <= %s AND user_id = %s",
+                    (start_date, end_date, user_id)
+                )
                 exp = Decimal(str(cursor.fetchone()['total']))
                 
-                cursor.execute("SELECT COALESCE(SUM(amount), 0) as total FROM income WHERE date >= %s AND date <= %s", (start_date, end_date))
+                cursor.execute(
+                    "SELECT COALESCE(SUM(amount), 0) as total FROM income WHERE date >= %s AND date <= %s AND user_id = %s",
+                    (start_date, end_date, user_id)
+                )
                 inc = Decimal(str(cursor.fetchone()['total']))
                 
                 savings = inc - exp
@@ -379,7 +363,6 @@ def get_trends():
                     'savings_rate': round(float(rate), 1)
                 })
                 
-                # Move to previous month
                 if current_date.month == 1:
                     current_date = current_date.replace(year=current_date.year - 1, month=12)
                 else:

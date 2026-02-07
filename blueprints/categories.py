@@ -1,18 +1,21 @@
 """
 Categories Blueprint - Handles all category-related API endpoints.
 
-Production-hardened endpoints:
+Production-hardened endpoints with USER ISOLATION:
 - Centralized validation using validators module
 - Flask g context for database connections
 - Proper error handling without leaking stack traces
+- AUTHENTICATION REQUIRED: All endpoints require valid JWT
+- USER ISOLATION: Each user can only access their own categories
 """
 
 import psycopg2
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request, jsonify, g
 
 from database import get_db
 from validators import validate_uuid, generate_uuid
 from errors import handle_db_error, error_response
+from auth import require_auth, get_current_user_id
 
 
 categories_bp = Blueprint('categories', __name__, url_prefix='/categories')
@@ -32,19 +35,24 @@ def format_category(row) -> dict:
 
 
 @categories_bp.route('', methods=['GET'])
+@require_auth
 def get_categories():
     """
     GET /categories
-    Returns list of all categories (active and inactive).
+    Returns list of all categories for the authenticated user.
     Ordered: active first, then alphabetically by name.
     """
+    user_id = get_current_user_id()
+    
     db = get_db()
     try:
         with db.cursor() as cursor:
             cursor.execute(
                 """SELECT id, name, is_active, created_at 
                    FROM categories 
-                   ORDER BY is_active DESC, name"""
+                   WHERE user_id = %s
+                   ORDER BY is_active DESC, name""",
+                (user_id,)
             )
             categories = cursor.fetchall()
         return jsonify([format_category(row) for row in categories]), 200
@@ -53,18 +61,21 @@ def get_categories():
 
 
 @categories_bp.route('', methods=['POST'])
+@require_auth
 def create_category():
     """
     POST /categories
-    Creates a new category.
+    Creates a new category for the authenticated user.
     
     Request body: { "name": "Category Name" }
     
     Returns:
         201: Created category object
         400: Validation error
-        409: Category name already exists
+        401: Unauthorized
+        409: Category name already exists for this user
     """
+    user_id = get_current_user_id()
     data = request.get_json()
     
     if not data:
@@ -87,16 +98,25 @@ def create_category():
     db = get_db()
     try:
         with db.cursor() as cursor:
+            # Check if category name already exists for this user
             cursor.execute(
-                "INSERT INTO categories (id, name) VALUES (%s, %s)",
-                (category_id, name)
+                "SELECT id FROM categories WHERE name = %s AND user_id = %s",
+                (name, user_id)
+            )
+            if cursor.fetchone():
+                return error_response('Category name already exists', 409)
+            
+            # Insert with user_id for isolation
+            cursor.execute(
+                "INSERT INTO categories (id, name, user_id) VALUES (%s, %s, %s)",
+                (category_id, name, user_id)
             )
             db.commit()
             
             # Fetch the created category
             cursor.execute(
-                "SELECT id, name, is_active, created_at FROM categories WHERE id = %s",
-                (category_id,)
+                "SELECT id, name, is_active, created_at FROM categories WHERE id = %s AND user_id = %s",
+                (category_id, user_id)
             )
             category = cursor.fetchone()
         
@@ -113,19 +133,23 @@ def create_category():
 
 
 @categories_bp.route('/<category_id>', methods=['PUT'])
+@require_auth
 def update_category(category_id):
     """
     PUT /categories/<uuid>
-    Renames an existing category.
+    Renames an existing category (must belong to authenticated user).
     
     Request body: { "name": "New Category Name" }
     
     Returns:
         200: Updated category object
         400: Validation error or invalid UUID
+        401: Unauthorized
         404: Category not found
         409: Category name already exists
     """
+    user_id = get_current_user_id()
+    
     # Validate UUID format
     valid, error = validate_uuid(category_id)
     if not valid:
@@ -149,24 +173,32 @@ def update_category(category_id):
     db = get_db()
     try:
         with db.cursor() as cursor:
-            # Check if category exists
+            # Check if category exists AND belongs to user
             cursor.execute(
-                "SELECT id FROM categories WHERE id = %s",
-                (category_id,)
+                "SELECT id FROM categories WHERE id = %s AND user_id = %s",
+                (category_id, user_id)
             )
             if not cursor.fetchone():
                 return error_response('Category not found', 404)
             
+            # Check for duplicate name for this user
             cursor.execute(
-                "UPDATE categories SET name = %s WHERE id = %s",
-                (name, category_id)
+                "SELECT id FROM categories WHERE name = %s AND user_id = %s AND id != %s",
+                (name, user_id, category_id)
+            )
+            if cursor.fetchone():
+                return error_response('Category name already exists', 409)
+            
+            cursor.execute(
+                "UPDATE categories SET name = %s WHERE id = %s AND user_id = %s",
+                (name, category_id, user_id)
             )
             db.commit()
             
             # Fetch the updated category
             cursor.execute(
-                "SELECT id, name, is_active, created_at FROM categories WHERE id = %s",
-                (category_id,)
+                "SELECT id, name, is_active, created_at FROM categories WHERE id = %s AND user_id = %s",
+                (category_id, user_id)
             )
             category = cursor.fetchone()
         
@@ -183,18 +215,22 @@ def update_category(category_id):
 
 
 @categories_bp.route('/<category_id>/status', methods=['PATCH'])
+@require_auth
 def update_category_status(category_id):
     """
     PATCH /categories/<uuid>/status
-    Updates a category's active status.
+    Updates a category's active status (must belong to authenticated user).
     
     Request body: { "is_active": boolean }
     
     Returns:
         200: Updated category object
         400: Validation error or invalid UUID
+        401: Unauthorized
         404: Category not found
     """
+    user_id = get_current_user_id()
+    
     # Validate UUID format
     valid, error = validate_uuid(category_id)
     if not valid:
@@ -214,22 +250,23 @@ def update_category_status(category_id):
     db = get_db()
     try:
         with db.cursor() as cursor:
+            # Check ownership
             cursor.execute(
-                "SELECT id FROM categories WHERE id = %s",
-                (category_id,)
+                "SELECT id FROM categories WHERE id = %s AND user_id = %s",
+                (category_id, user_id)
             )
             if not cursor.fetchone():
                 return error_response('Category not found', 404)
             
             cursor.execute(
-                "UPDATE categories SET is_active = %s WHERE id = %s",
-                (is_active, category_id)
+                "UPDATE categories SET is_active = %s WHERE id = %s AND user_id = %s",
+                (is_active, category_id, user_id)
             )
             db.commit()
             
             cursor.execute(
-                "SELECT id, name, is_active, created_at FROM categories WHERE id = %s",
-                (category_id,)
+                "SELECT id, name, is_active, created_at FROM categories WHERE id = %s AND user_id = %s",
+                (category_id, user_id)
             )
             category = cursor.fetchone()
         
@@ -241,16 +278,20 @@ def update_category_status(category_id):
 
 
 @categories_bp.route('/<category_id>', methods=['DELETE'])
+@require_auth
 def delete_category(category_id):
     """
     DELETE /categories/<uuid>
-    Soft deletes a category by setting is_active = false.
+    Soft deletes a category by setting is_active = false (must belong to user).
     
     Returns:
         200: Success message
         400: Invalid UUID or category already deleted
+        401: Unauthorized
         404: Category not found
     """
+    user_id = get_current_user_id()
+    
     # Validate UUID format
     valid, error = validate_uuid(category_id)
     if not valid:
@@ -259,10 +300,10 @@ def delete_category(category_id):
     db = get_db()
     try:
         with db.cursor() as cursor:
-            # Check if category exists and get current status
+            # Check if category exists, get status, and verify ownership
             cursor.execute(
-                "SELECT id, is_active FROM categories WHERE id = %s",
-                (category_id,)
+                "SELECT id, is_active FROM categories WHERE id = %s AND user_id = %s",
+                (category_id, user_id)
             )
             category = cursor.fetchone()
             
@@ -272,10 +313,10 @@ def delete_category(category_id):
             if category['is_active'] == False:
                 return error_response('Category is already deleted', 400)
             
-            # Soft delete - set is_active to false
+            # Soft delete with ownership enforcement
             cursor.execute(
-                "UPDATE categories SET is_active = FALSE WHERE id = %s",
-                (category_id,)
+                "UPDATE categories SET is_active = FALSE WHERE id = %s AND user_id = %s",
+                (category_id, user_id)
             )
             db.commit()
         
@@ -287,11 +328,14 @@ def delete_category(category_id):
 
 
 @categories_bp.route('/seed', methods=['POST'])
+@require_auth
 def seed_categories():
     """
     POST /categories/seed
-    Seeds default Indian categories if they don't exist.
+    Seeds default Indian categories for the authenticated user if they don't exist.
     """
+    user_id = get_current_user_id()
+    
     INDIAN_CATEGORIES = [
         "Groceries (Sabzi Mandi)",
         "Transportation (Auto/Bus)",
@@ -314,16 +358,19 @@ def seed_categories():
     try:
         with db.cursor() as cursor:
             for name in INDIAN_CATEGORIES:
-                # Check if exists
-                cursor.execute("SELECT id FROM categories WHERE name = %s", (name,))
+                # Check if exists for this user
+                cursor.execute(
+                    "SELECT id FROM categories WHERE name = %s AND user_id = %s",
+                    (name, user_id)
+                )
                 if cursor.fetchone():
                     skipped_count += 1
                     continue
                     
                 cat_id = generate_uuid()
                 cursor.execute(
-                    "INSERT INTO categories (id, name, is_active) VALUES (%s, %s, TRUE)",
-                    (cat_id, name)
+                    "INSERT INTO categories (id, name, is_active, user_id) VALUES (%s, %s, TRUE, %s)",
+                    (cat_id, name, user_id)
                 )
                 added_count += 1
             

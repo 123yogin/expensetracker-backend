@@ -1,23 +1,36 @@
-from flask import Blueprint, request, jsonify
+"""
+Groups Blueprint - Handles group expense splitting functionality.
+
+Production-hardened endpoints with USER ISOLATION:
+- AUTHENTICATION REQUIRED: All endpoints require valid JWT
+- USER ISOLATION: Each user can only access their own groups
+"""
+
+from flask import Blueprint, request, jsonify, g
 from database import get_db
-from errors import handle_db_error
+from errors import handle_db_error, error_response
 from validators import generate_uuid
+from auth import require_auth, get_current_user_id
 import json
 
 groups_bp = Blueprint('groups', __name__)
 
 @groups_bp.route('/groups', methods=['GET'])
+@require_auth
 def get_groups():
-    """Get all groups with their members"""
+    """Get all groups for the authenticated user with their members"""
+    user_id = get_current_user_id()
+    
     try:
         db = get_db()
         with db.cursor() as cursor:
-            # Get groups
+            # Get user's groups
             cursor.execute("""
                 SELECT id, name, description, created_at 
                 FROM groups 
+                WHERE user_id = %s
                 ORDER BY created_at DESC
-            """)
+            """, (user_id,))
             groups = cursor.fetchall() or []
             
             # Get members for each group
@@ -34,24 +47,28 @@ def get_groups():
         return handle_db_error(e, "Failed to get groups")
 
 @groups_bp.route('/groups', methods=['POST'])
+@require_auth
 def create_group():
-    """Create a new group"""
+    """Create a new group for the authenticated user"""
+    user_id = get_current_user_id()
+    
     data = request.get_json()
     name = data.get('name')
     description = data.get('description')
-    members = data.get('members', []) # List of member names
+    members = data.get('members', [])  # List of member names
     
     if not name:
-        return jsonify({'error': 'Group name is required'}), 400
+        return error_response('Group name is required', 400)
         
     try:
         db = get_db()
         with db.cursor() as cursor:
             group_id = generate_uuid()
+            # Insert with user_id
             cursor.execute("""
-                INSERT INTO groups (id, name, description)
-                VALUES (%s, %s, %s)
-            """, (group_id, name, description))
+                INSERT INTO groups (id, name, description, user_id)
+                VALUES (%s, %s, %s, %s)
+            """, (group_id, name, description, user_id))
             
             # Add members
             for member_name in members:
@@ -68,11 +85,22 @@ def create_group():
         return handle_db_error(e, "Failed to create group")
 
 @groups_bp.route('/groups/<group_id>/expenses', methods=['GET'])
+@require_auth
 def get_group_expenses(group_id):
-    """Get expenses for a specific group"""
+    """Get expenses for a specific group (must belong to authenticated user)"""
+    user_id = get_current_user_id()
+    
     try:
         db = get_db()
         with db.cursor() as cursor:
+            # Verify group ownership
+            cursor.execute(
+                "SELECT id FROM groups WHERE id = %s AND user_id = %s",
+                (group_id, user_id)
+            )
+            if not cursor.fetchone():
+                return error_response('Group not found', 404)
+            
             # Get expenses with enhanced details
             cursor.execute("""
                 SELECT e.id, e.amount, e.note as description, e.date, 
@@ -102,30 +130,41 @@ def get_group_expenses(group_id):
         return handle_db_error(e, "Failed to get group expenses")
 
 @groups_bp.route('/groups/<group_id>/expenses', methods=['POST'])
+@require_auth
 def add_group_expense(group_id):
-    """Add a split expense to a group"""
+    """Add a split expense to a group (must belong to authenticated user)"""
+    user_id = get_current_user_id()
+    
     data = request.get_json()
     amount = data.get('amount')
     description = data.get('description')
     date = data.get('date')
     paid_by_id = data.get('paid_by_id')
-    splits = data.get('splits') # List of {member_id: uuid, amount: float}
+    splits = data.get('splits')  # List of {member_id: uuid, amount: float}
     
     if not all([amount, description, date, paid_by_id, splits]):
-        return jsonify({'error': 'Missing required fields'}), 400
+        return error_response('Missing required fields', 400)
         
     try:
         db = get_db()
         with db.cursor() as cursor:
+            # Verify group ownership
+            cursor.execute(
+                "SELECT id FROM groups WHERE id = %s AND user_id = %s",
+                (group_id, user_id)
+            )
+            if not cursor.fetchone():
+                return error_response('Group not found', 404)
+            
             expense_id = generate_uuid()
             
-            # 1. Create the expense record
+            # Create the expense record with user_id
             cursor.execute("""
-                INSERT INTO expenses (id, amount, note, date, group_id, paid_by_member_id)
-                VALUES (%s, %s, %s, %s, %s, %s)
-            """, (expense_id, amount, description, date, group_id, paid_by_id))
+                INSERT INTO expenses (id, amount, note, date, group_id, paid_by_member_id, user_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """, (expense_id, amount, description, date, group_id, paid_by_id, user_id))
             
-            # 2. Create split records
+            # Create split records
             for split in splits:
                 if split['amount'] > 0:
                     cursor.execute("""

@@ -1,16 +1,18 @@
 """
 Expenses Blueprint - Handles all expense-related API endpoints.
 
-Production-hardened endpoints:
+Production-hardened endpoints with USER ISOLATION:
 - Strict validation with centralized validators
 - Decimal amounts quantized to 2 decimal places
 - Future date rejection
 - Flask g context for database connections
 - Proper error handling without leaking stack traces
+- AUTHENTICATION REQUIRED: All endpoints require valid JWT
+- USER ISOLATION: Each user can only access their own expenses
 """
 
 import psycopg2
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request, jsonify, g
 
 from database import get_db
 from validators import (
@@ -21,6 +23,7 @@ from validators import (
     generate_uuid
 )
 from errors import handle_db_error, error_response
+from auth import require_auth, get_current_user_id
 
 
 expenses_bp = Blueprint('expenses', __name__, url_prefix='/expenses')
@@ -59,10 +62,11 @@ EXPENSE_SELECT_QUERY = """
 
 
 @expenses_bp.route('', methods=['GET'])
+@require_auth
 def get_expenses():
     """
     GET /expenses
-    List expenses with optional filters.
+    List expenses for the authenticated user with optional filters.
     
     Query parameters:
         start_date: YYYY-MM-DD (optional)
@@ -70,19 +74,21 @@ def get_expenses():
         category_id: UUID (optional)
     
     Returns:
-        200: List of expense objects
+        200: List of expense objects (user's expenses only)
         400: Validation error
+        401: Unauthorized
     """
+    user_id = get_current_user_id()
+    
     start_date = request.args.get('start_date')
     end_date = request.args.get('end_date')
     category_id = request.args.get('category_id')
     
-    # Build query with optional filters (parameterized for SQL injection safety)
-    query = EXPENSE_SELECT_QUERY + " WHERE 1=1"
-    params = []
+    # Build query with USER ISOLATION filter
+    query = EXPENSE_SELECT_QUERY + " WHERE e.user_id = %s"
+    params = [user_id]
     
     if start_date:
-        # Allow past dates in filters (don't reject future for filtering)
         valid, error = validate_date(start_date, reject_future=False)
         if not valid:
             return error_response(f'Invalid start_date: {error}', 400)
@@ -117,10 +123,11 @@ def get_expenses():
 
 
 @expenses_bp.route('', methods=['POST'])
+@require_auth
 def create_expense():
     """
     POST /expenses
-    Create a new expense.
+    Create a new expense for the authenticated user.
     
     Request body: {
         "date": "YYYY-MM-DD",      (required, cannot be future)
@@ -132,8 +139,10 @@ def create_expense():
     Returns:
         201: Created expense object
         400: Validation error
+        401: Unauthorized
         404: Category not found or inactive
     """
+    user_id = get_current_user_id()
     data = request.get_json()
     
     if not data:
@@ -175,10 +184,10 @@ def create_expense():
     db = get_db()
     try:
         with db.cursor() as cursor:
-            # Verify category exists and is active (single query)
+            # Verify category exists, is active, and BELONGS TO USER
             cursor.execute(
-                "SELECT id FROM categories WHERE id = %s AND is_active = TRUE",
-                (category_id,)
+                "SELECT id FROM categories WHERE id = %s AND is_active = TRUE AND user_id = %s",
+                (category_id, user_id)
             )
             if not cursor.fetchone():
                 return error_response('Category not found or inactive', 404)
@@ -193,18 +202,18 @@ def create_expense():
                 if error:
                     return error_response(f'Invalid split_amount: {error}', 400)
             
-            # Insert expense with validated amount
+            # Insert expense with user_id for isolation
             cursor.execute(
-                """INSERT INTO expenses (id, date, amount, category_id, note, is_split, split_amount, split_with)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
-                (expense_id, date, str(validated_amount), category_id, note, is_split, str(split_amount), split_with)
+                """INSERT INTO expenses (id, date, amount, category_id, note, is_split, split_amount, split_with, user_id)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                (expense_id, date, str(validated_amount), category_id, note, is_split, str(split_amount), split_with, user_id)
             )
             db.commit()
             
             # Fetch the created expense with category name
             cursor.execute(
-                EXPENSE_SELECT_QUERY + " WHERE e.id = %s",
-                (expense_id,)
+                EXPENSE_SELECT_QUERY + " WHERE e.id = %s AND e.user_id = %s",
+                (expense_id, user_id)
             )
             expense = cursor.fetchone()
         
@@ -221,10 +230,11 @@ def create_expense():
 
 
 @expenses_bp.route('/<expense_id>', methods=['PUT'])
+@require_auth
 def update_expense(expense_id):
     """
     PUT /expenses/<uuid>
-    Update an existing expense.
+    Update an existing expense (must belong to authenticated user).
     
     Request body (all fields optional): {
         "date": "YYYY-MM-DD",
@@ -236,8 +246,11 @@ def update_expense(expense_id):
     Returns:
         200: Updated expense object
         400: Validation error or no fields to update
-        404: Expense or category not found
+        401: Unauthorized
+        404: Expense not found (or belongs to another user)
     """
+    user_id = get_current_user_id()
+    
     # Validate expense UUID format
     valid, error = validate_uuid(expense_id)
     if not valid:
@@ -251,10 +264,10 @@ def update_expense(expense_id):
     db = get_db()
     try:
         with db.cursor() as cursor:
-            # Check if expense exists
+            # Check if expense exists AND belongs to user (ownership check)
             cursor.execute(
-                "SELECT id FROM expenses WHERE id = %s",
-                (expense_id,)
+                "SELECT id FROM expenses WHERE id = %s AND user_id = %s",
+                (expense_id, user_id)
             )
             if not cursor.fetchone():
                 return error_response('Expense not found', 404)
@@ -283,10 +296,10 @@ def update_expense(expense_id):
                 if not valid:
                     return error_response(f'Invalid category_id: {error}', 400)
                 
-                # Verify category exists and is active
+                # Verify category exists, is active, and BELONGS TO USER
                 cursor.execute(
-                    "SELECT id FROM categories WHERE id = %s AND is_active = TRUE",
-                    (category_id,)
+                    "SELECT id FROM categories WHERE id = %s AND is_active = TRUE AND user_id = %s",
+                    (category_id, user_id)
                 )
                 if not cursor.fetchone():
                     return error_response('Category not found or inactive', 404)
@@ -326,16 +339,17 @@ def update_expense(expense_id):
             # Add updated_at timestamp
             updates.append("updated_at = CURRENT_TIMESTAMP")
             params.append(expense_id)
+            params.append(user_id)  # Enforce ownership in WHERE clause
             
-            # Execute update (parameterized query for SQL injection safety)
-            query = f"UPDATE expenses SET {', '.join(updates)} WHERE id = %s"
+            # Execute update with ownership check
+            query = f"UPDATE expenses SET {', '.join(updates)} WHERE id = %s AND user_id = %s"
             cursor.execute(query, params)
             db.commit()
             
             # Fetch the updated expense
             cursor.execute(
-                EXPENSE_SELECT_QUERY + " WHERE e.id = %s",
-                (expense_id,)
+                EXPENSE_SELECT_QUERY + " WHERE e.id = %s AND e.user_id = %s",
+                (expense_id, user_id)
             )
             expense = cursor.fetchone()
         
@@ -352,16 +366,20 @@ def update_expense(expense_id):
 
 
 @expenses_bp.route('/<expense_id>', methods=['DELETE'])
+@require_auth
 def delete_expense(expense_id):
     """
     DELETE /expenses/<uuid>
-    Hard deletes an expense (non-recoverable).
+    Hard deletes an expense (must belong to authenticated user).
     
     Returns:
         200: Success message
         400: Invalid UUID
-        404: Expense not found
+        401: Unauthorized
+        404: Expense not found (or belongs to another user)
     """
+    user_id = get_current_user_id()
+    
     # Validate UUID format
     valid, error = validate_uuid(expense_id)
     if not valid:
@@ -370,15 +388,19 @@ def delete_expense(expense_id):
     db = get_db()
     try:
         with db.cursor() as cursor:
-            # Check if expense exists
+            # Check if expense exists AND belongs to user
             cursor.execute(
-                "SELECT id FROM expenses WHERE id = %s",
-                (expense_id,)
+                "SELECT id FROM expenses WHERE id = %s AND user_id = %s",
+                (expense_id, user_id)
             )
             if not cursor.fetchone():
                 return error_response('Expense not found', 404)
             
-            cursor.execute("DELETE FROM expenses WHERE id = %s", (expense_id,))
+            # Delete with ownership enforcement
+            cursor.execute(
+                "DELETE FROM expenses WHERE id = %s AND user_id = %s",
+                (expense_id, user_id)
+            )
             db.commit()
         
         return jsonify({'message': 'Expense deleted successfully'}), 200

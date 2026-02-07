@@ -1,23 +1,22 @@
 """
 Receipts Blueprint - Handles receipt photo capture and processing.
 
-Features:
-- Receipt photo upload and storage
-- Basic text extraction (OCR simulation)
-- Receipt-expense linking
-- Receipt management
+Production-hardened endpoints with USER ISOLATION:
+- AUTHENTICATION REQUIRED: All endpoints require valid JWT
+- USER ISOLATION: Each user can only access their own receipts
 """
 
 import os
 import uuid
 import json
 from datetime import datetime
-from flask import Blueprint, request, jsonify, current_app
+from flask import Blueprint, request, jsonify, current_app, g
 from werkzeug.utils import secure_filename
 
 from database import get_db
 from validators import validate_uuid, generate_uuid
 from errors import handle_db_error, error_response
+from auth import require_auth, get_current_user_id
 
 receipts_bp = Blueprint('receipts', __name__, url_prefix='/receipts')
 
@@ -41,14 +40,10 @@ def simulate_ocr(filename):
     Simulate OCR processing for receipt text extraction.
     In a real implementation, this would use OCR libraries like Tesseract.
     """
-    # Simulate extracted text based on filename patterns
     extracted_text = f"Receipt from store - {filename}"
     
-    # Simulate amount extraction (random for demo)
     import random
     extracted_amount = round(random.uniform(10.0, 500.0), 2)
-    
-    # Simulate date extraction (today's date)
     extracted_date = datetime.now().date()
     
     return {
@@ -57,20 +52,16 @@ def simulate_ocr(filename):
         'date': extracted_date
     }
 
+
 @receipts_bp.route('/upload', methods=['POST'])
+@require_auth
 def upload_receipt():
     """
     POST /receipts/upload
-    Upload a receipt photo.
-    
-    Form Data:
-        file: Receipt image file (required)
-        expense_id: UUID (optional, to link to existing expense)
-    
-    Returns:
-        201: Receipt uploaded successfully
-        400: Validation error
+    Upload a receipt photo for the authenticated user.
     """
+    user_id = get_current_user_id()
+    
     if 'file' not in request.files:
         return error_response("No file provided", 400)
     
@@ -90,22 +81,27 @@ def upload_receipt():
         return error_response("File too large. Maximum size is 10MB", 400)
     
     expense_id = request.form.get('expense_id')
-    if expense_id and not validate_uuid(expense_id):
-        return error_response("Invalid expense_id", 400)
+    if expense_id:
+        valid, error = validate_uuid(expense_id)
+        if not valid:
+            return error_response("Invalid expense_id", 400)
     
     db = get_db()
     try:
         with db.cursor() as cursor:
-            # Check if expense exists (if provided)
+            # Check if expense exists and belongs to user (if provided)
             if expense_id:
-                cursor.execute("SELECT id FROM expenses WHERE id = %s", (expense_id,))
+                cursor.execute(
+                    "SELECT id FROM expenses WHERE id = %s AND user_id = %s",
+                    (expense_id, user_id)
+                )
                 if not cursor.fetchone():
                     return error_response("Expense not found", 404)
             
-            # Generate unique filename
+            # Generate unique filename with user_id prefix
             receipt_id = generate_uuid()
             file_extension = file.filename.rsplit('.', 1)[1].lower()
-            filename = f"{receipt_id}.{file_extension}"
+            filename = f"{user_id}_{receipt_id}.{file_extension}"
             
             # Save file
             upload_folder = get_upload_folder()
@@ -115,24 +111,24 @@ def upload_receipt():
             # Simulate OCR processing
             ocr_result = simulate_ocr(file.filename)
             
-            # Save receipt record
+            # Save receipt record with user_id
             cursor.execute("""
                 INSERT INTO receipt_photos 
                 (id, expense_id, filename, original_filename, file_size, mime_type, 
-                 processed, extracted_text, extracted_amount, extracted_date)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 processed, extracted_text, extracted_amount, extracted_date, user_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """, (
                 receipt_id, expense_id, filename, file.filename, file_size,
                 file.content_type, True, ocr_result['text'], 
-                ocr_result['amount'], ocr_result['date']
+                ocr_result['amount'], ocr_result['date'], user_id
             ))
             
             # Update expense with receipt_photo_id if expense_id provided
             if expense_id:
                 cursor.execute("""
                     UPDATE expenses SET receipt_photo_id = %s, updated_at = CURRENT_TIMESTAMP
-                    WHERE id = %s
-                """, (receipt_id, expense_id))
+                    WHERE id = %s AND user_id = %s
+                """, (receipt_id, expense_id, user_id))
             
             db.commit()
             
@@ -148,7 +144,6 @@ def upload_receipt():
             }), 201
             
     except Exception as e:
-        # Clean up file if database operation failed
         try:
             if 'file_path' in locals():
                 os.remove(file_path)
@@ -156,17 +151,18 @@ def upload_receipt():
             pass
         return handle_db_error(e, "Failed to upload receipt")
 
+
 @receipts_bp.route('/<receipt_id>', methods=['GET'])
+@require_auth
 def get_receipt(receipt_id):
     """
     GET /receipts/{id}
-    Get receipt details.
-    
-    Returns:
-        200: Receipt details
-        404: Receipt not found
+    Get receipt details (must belong to authenticated user).
     """
-    if not validate_uuid(receipt_id):
+    user_id = get_current_user_id()
+    
+    valid, error = validate_uuid(receipt_id)
+    if not valid:
         return error_response("Invalid receipt ID", 400)
     
     db = get_db()
@@ -181,8 +177,8 @@ def get_receipt(receipt_id):
                 FROM receipt_photos r
                 LEFT JOIN expenses e ON r.expense_id = e.id
                 LEFT JOIN categories c ON e.category_id = c.id
-                WHERE r.id = %s
-            """, (receipt_id,))
+                WHERE r.id = %s AND r.user_id = %s
+            """, (receipt_id, user_id))
             
             row = cursor.fetchone()
             if not row:
@@ -213,52 +209,57 @@ def get_receipt(receipt_id):
     except Exception as e:
         return handle_db_error(e, "Failed to fetch receipt")
 
+
 @receipts_bp.route('/<receipt_id>/link', methods=['POST'])
+@require_auth
 def link_receipt_to_expense(receipt_id):
     """
     POST /receipts/{id}/link
-    Link receipt to an expense.
-    
-    Body:
-        expense_id: UUID (required)
-    
-    Returns:
-        200: Receipt linked successfully
-        404: Receipt or expense not found
+    Link receipt to an expense (both must belong to authenticated user).
     """
-    if not validate_uuid(receipt_id):
+    user_id = get_current_user_id()
+    
+    valid, error = validate_uuid(receipt_id)
+    if not valid:
         return error_response("Invalid receipt ID", 400)
     
     data = request.get_json()
     expense_id = data.get('expense_id')
     
-    if not validate_uuid(expense_id):
+    valid, error = validate_uuid(expense_id)
+    if not valid:
         return error_response("Valid expense_id is required", 400)
     
     db = get_db()
     try:
         with db.cursor() as cursor:
-            # Check if receipt exists
-            cursor.execute("SELECT id FROM receipt_photos WHERE id = %s", (receipt_id,))
+            # Check if receipt exists and belongs to user
+            cursor.execute(
+                "SELECT id FROM receipt_photos WHERE id = %s AND user_id = %s",
+                (receipt_id, user_id)
+            )
             if not cursor.fetchone():
                 return error_response("Receipt not found", 404)
             
-            # Check if expense exists
-            cursor.execute("SELECT id FROM expenses WHERE id = %s", (expense_id,))
+            # Check if expense exists and belongs to user
+            cursor.execute(
+                "SELECT id FROM expenses WHERE id = %s AND user_id = %s",
+                (expense_id, user_id)
+            )
             if not cursor.fetchone():
                 return error_response("Expense not found", 404)
             
             # Update receipt with expense_id
             cursor.execute("""
                 UPDATE receipt_photos SET expense_id = %s
-                WHERE id = %s
-            """, (expense_id, receipt_id))
+                WHERE id = %s AND user_id = %s
+            """, (expense_id, receipt_id, user_id))
             
             # Update expense with receipt_photo_id
             cursor.execute("""
                 UPDATE expenses SET receipt_photo_id = %s, updated_at = CURRENT_TIMESTAMP
-                WHERE id = %s
-            """, (receipt_id, expense_id))
+                WHERE id = %s AND user_id = %s
+            """, (receipt_id, expense_id, user_id))
             
             db.commit()
             return jsonify({'message': 'Receipt linked to expense successfully'})
@@ -266,24 +267,23 @@ def link_receipt_to_expense(receipt_id):
     except Exception as e:
         return handle_db_error(e, "Failed to link receipt to expense")
 
+
 @receipts_bp.route('', methods=['GET'])
+@require_auth
 def get_receipts():
     """
     GET /receipts
-    Get all receipts with optional filters.
-    
-    Query Parameters:
-        expense_id: UUID (optional)
-        unlinked: boolean (optional, show only unlinked receipts)
-    
-    Returns:
-        200: List of receipts
+    Get all receipts for authenticated user with optional filters.
     """
+    user_id = get_current_user_id()
+    
     expense_id = request.args.get('expense_id')
     unlinked = request.args.get('unlinked', '').lower() == 'true'
     
-    if expense_id and not validate_uuid(expense_id):
-        return error_response("Invalid expense_id", 400)
+    if expense_id:
+        valid, error = validate_uuid(expense_id)
+        if not valid:
+            return error_response("Invalid expense_id", 400)
     
     db = get_db()
     try:
@@ -296,9 +296,9 @@ def get_receipts():
                 FROM receipt_photos r
                 LEFT JOIN expenses e ON r.expense_id = e.id
                 LEFT JOIN categories c ON e.category_id = c.id
-                WHERE 1=1
+                WHERE r.user_id = %s
             """
-            params = []
+            params = [user_id]
             
             if expense_id:
                 query += " AND r.expense_id = %s"
@@ -331,24 +331,28 @@ def get_receipts():
     except Exception as e:
         return handle_db_error(e, "Failed to fetch receipts")
 
+
 @receipts_bp.route('/<receipt_id>', methods=['DELETE'])
+@require_auth
 def delete_receipt(receipt_id):
     """
     DELETE /receipts/{id}
-    Delete a receipt and its file.
-    
-    Returns:
-        204: Receipt deleted
-        404: Receipt not found
+    Delete a receipt and its file (must belong to authenticated user).
     """
-    if not validate_uuid(receipt_id):
+    user_id = get_current_user_id()
+    
+    valid, error = validate_uuid(receipt_id)
+    if not valid:
         return error_response("Invalid receipt ID", 400)
     
     db = get_db()
     try:
         with db.cursor() as cursor:
-            # Get receipt details
-            cursor.execute("SELECT filename, expense_id FROM receipt_photos WHERE id = %s", (receipt_id,))
+            # Get receipt details (verify ownership)
+            cursor.execute(
+                "SELECT filename, expense_id FROM receipt_photos WHERE id = %s AND user_id = %s",
+                (receipt_id, user_id)
+            )
             row = cursor.fetchone()
             
             if not row:
@@ -361,11 +365,14 @@ def delete_receipt(receipt_id):
             if expense_id:
                 cursor.execute("""
                     UPDATE expenses SET receipt_photo_id = NULL, updated_at = CURRENT_TIMESTAMP
-                    WHERE id = %s
-                """, (expense_id,))
+                    WHERE id = %s AND user_id = %s
+                """, (expense_id, user_id))
             
             # Delete receipt record
-            cursor.execute("DELETE FROM receipt_photos WHERE id = %s", (receipt_id,))
+            cursor.execute(
+                "DELETE FROM receipt_photos WHERE id = %s AND user_id = %s",
+                (receipt_id, user_id)
+            )
             
             # Delete physical file
             try:
@@ -374,7 +381,6 @@ def delete_receipt(receipt_id):
                 if os.path.exists(file_path):
                     os.remove(file_path)
             except Exception as file_error:
-                # Log error but don't fail the request
                 current_app.logger.warning(f"Failed to delete receipt file {filename}: {file_error}")
             
             db.commit()

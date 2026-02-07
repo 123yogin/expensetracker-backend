@@ -1,24 +1,36 @@
-from flask import Blueprint, jsonify
+"""
+Notifications Blueprint - Handles budget alerts and notifications.
+
+Production-hardened endpoints with USER ISOLATION:
+- AUTHENTICATION REQUIRED: All endpoints require valid JWT
+- USER ISOLATION: Each user only sees alerts for their own data
+"""
+
+from flask import Blueprint, jsonify, g
 from database import get_db
 from errors import handle_db_error
 from datetime import datetime
+from auth import require_auth, get_current_user_id
 
 notifications_bp = Blueprint('notifications', __name__)
 
 @notifications_bp.route('/notifications/alerts', methods=['GET'])
+@require_auth
 def get_alerts():
-    """Get active budget alerts"""
+    """Get active budget alerts for the authenticated user"""
+    user_id = get_current_user_id()
+    
     try:
         current_month = datetime.now().strftime('%Y-%m')
         
         db = get_db()
         with db.cursor() as cursor:
-            # 1. Check for new alerts (Budget vs Actual)
+            # Check for new alerts (Budget vs Actual) - user's data only
             cursor.execute("""
                 WITH monthly_spending AS (
                     SELECT category_id, SUM(amount) as spent
                     FROM expenses 
-                    WHERE to_char(date, 'YYYY-MM') = %s
+                    WHERE to_char(date, 'YYYY-MM') = %s AND user_id = %s
                     GROUP BY category_id
                 )
                 SELECT 
@@ -29,7 +41,8 @@ def get_alerts():
                 FROM budgets b
                 JOIN categories c ON b.category_id = c.id
                 LEFT JOIN monthly_spending ms ON b.category_id = ms.category_id
-            """, (current_month,))
+                WHERE b.user_id = %s
+            """, (current_month, user_id, user_id))
             
             budgets = cursor.fetchall()
             
@@ -54,12 +67,12 @@ def get_alerts():
                             'category_id': b['category_id']
                         })
             
-            # 2. Check for Low Balance / Cash Flow Warning
+            # Check for Low Balance / Cash Flow Warning - user's data only
             cursor.execute("""
                 SELECT 
-                    (SELECT COALESCE(SUM(amount), 0) FROM income WHERE to_char(date, 'YYYY-MM') = %s) as total_income,
-                    (SELECT COALESCE(SUM(amount), 0) FROM expenses WHERE to_char(date, 'YYYY-MM') = %s) as total_expense
-            """, (current_month, current_month))
+                    (SELECT COALESCE(SUM(amount), 0) FROM income WHERE to_char(date, 'YYYY-MM') = %s AND user_id = %s) as total_income,
+                    (SELECT COALESCE(SUM(amount), 0) FROM expenses WHERE to_char(date, 'YYYY-MM') = %s AND user_id = %s) as total_expense
+            """, (current_month, user_id, current_month, user_id))
             cash_flow = cursor.fetchone()
             
             if cash_flow:
@@ -67,7 +80,7 @@ def get_alerts():
                 expenses = float(cash_flow['total_expense'])
                 balance = income - expenses
                 
-                # Alert if spending > 90% of income (Living Paycheck to Paycheck warning)
+                # Alert if spending > 90% of income
                 if income > 0 and expenses > (income * 0.9):
                      alerts.append({
                         'type': 'warning',

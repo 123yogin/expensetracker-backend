@@ -1,9 +1,13 @@
 """
 Recurring Expenses Blueprint
 Handles management of recurring bills and expenses.
+
+Production-hardened endpoints with USER ISOLATION:
+- AUTHENTICATION REQUIRED: All endpoints require valid JWT
+- USER ISOLATION: Each user can only access their own recurring expenses
 """
 
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request, jsonify, g
 from datetime import date, timedelta
 import psycopg2
 
@@ -16,6 +20,7 @@ from validators import (
     generate_uuid
 )
 from errors import handle_db_error, error_response
+from auth import require_auth, get_current_user_id
 
 recurring_bp = Blueprint('recurring', __name__, url_prefix='/recurring')
 
@@ -38,11 +43,14 @@ def format_recurring(row):
     }
 
 @recurring_bp.route('', methods=['GET'])
+@require_auth
 def get_recurring_expenses():
     """
     GET /recurring
-    List all recurring expenses (active first, then by next_date).
+    List all recurring expenses for the authenticated user (active first, then by next_date).
     """
+    user_id = get_current_user_id()
+    
     db = get_db()
     try:
         with db.cursor() as cursor:
@@ -53,8 +61,9 @@ def get_recurring_expenses():
                     c.name as category_name
                 FROM recurring_expenses r
                 LEFT JOIN categories c ON r.category_id = c.id
+                WHERE r.user_id = %s
                 ORDER BY r.is_active DESC, r.next_date ASC
-            """)
+            """, (user_id,))
             items = cursor.fetchall()
             
         return jsonify([format_recurring(item) for item in items]), 200
@@ -62,11 +71,14 @@ def get_recurring_expenses():
         return handle_db_error(e)
 
 @recurring_bp.route('/upcoming', methods=['GET'])
+@require_auth
 def get_upcoming_bills():
     """
     GET /recurring/upcoming
-    Get bills due in the next 30 days.
+    Get user's bills due in the next 30 days.
     """
+    user_id = get_current_user_id()
+    
     days = request.args.get('days', 30, type=int)
     today = date.today()
     limit_date = today + timedelta(days=days)
@@ -84,8 +96,9 @@ def get_upcoming_bills():
                 WHERE r.is_active = TRUE 
                 AND r.next_date >= %s 
                 AND r.next_date <= %s
+                AND r.user_id = %s
                 ORDER BY r.next_date ASC
-            """, (today, limit_date))
+            """, (today, limit_date, user_id))
             items = cursor.fetchall()
             
         return jsonify([format_recurring(item) for item in items]), 200
@@ -93,11 +106,14 @@ def get_upcoming_bills():
         return handle_db_error(e)
 
 @recurring_bp.route('', methods=['POST'])
+@require_auth
 def create_recurring():
     """
     POST /recurring
-    Create a new recurring expense.
+    Create a new recurring expense for the authenticated user.
     """
+    user_id = get_current_user_id()
+    
     data = request.get_json()
     if not data:
         return error_response('Request body is required', 400)
@@ -134,17 +150,21 @@ def create_recurring():
     db = get_db()
     try:
         with db.cursor() as cursor:
-            # Check category if provided
+            # Check category if provided AND verify ownership
             if category_id:
-                cursor.execute("SELECT id FROM categories WHERE id = %s", (category_id,))
+                cursor.execute(
+                    "SELECT id FROM categories WHERE id = %s AND user_id = %s",
+                    (category_id, user_id)
+                )
                 if not cursor.fetchone():
                     return error_response('Category not found', 404)
             
+            # Insert with user_id
             cursor.execute("""
                 INSERT INTO recurring_expenses 
-                (id, title, amount, category_id, frequency, next_date, note)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
-            """, (new_id, title.strip(), str(validated_amount), category_id, frequency, next_date_str, note))
+                (id, title, amount, category_id, frequency, next_date, note, user_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            """, (new_id, title.strip(), str(validated_amount), category_id, frequency, next_date_str, note, user_id))
             
             db.commit()
             
@@ -156,8 +176,8 @@ def create_recurring():
                     c.name as category_name
                 FROM recurring_expenses r
                 LEFT JOIN categories c ON r.category_id = c.id
-                WHERE r.id = %s
-            """, (new_id,))
+                WHERE r.id = %s AND r.user_id = %s
+            """, (new_id, user_id))
             item = cursor.fetchone()
             
         return jsonify(format_recurring(item)), 201
@@ -167,11 +187,14 @@ def create_recurring():
         return handle_db_error(e)
 
 @recurring_bp.route('/<item_id>', methods=['PUT'])
+@require_auth
 def update_recurring(item_id):
     """
     PUT /recurring/<item_id>
-    Update a recurring expense.
+    Update a recurring expense (must belong to authenticated user).
     """
+    user_id = get_current_user_id()
+    
     valid, error = validate_uuid(item_id)
     if not valid:
         return error_response(error, 400)
@@ -183,8 +206,11 @@ def update_recurring(item_id):
     db = get_db()
     try:
         with db.cursor() as cursor:
-            # Check existence
-            cursor.execute("SELECT id FROM recurring_expenses WHERE id = %s", (item_id,))
+            # Check existence AND ownership
+            cursor.execute(
+                "SELECT id FROM recurring_expenses WHERE id = %s AND user_id = %s",
+                (item_id, user_id)
+            )
             if not cursor.fetchone():
                 return error_response('Recurring expense not found', 404)
             
@@ -211,8 +237,11 @@ def update_recurring(item_id):
                     valid, error = validate_uuid(cat_id)
                     if not valid:
                         return error_response(f'Invalid category_id: {error}', 400)
-                    # Verify category
-                    cursor.execute("SELECT id FROM categories WHERE id = %s", (cat_id,))
+                    # Verify category ownership
+                    cursor.execute(
+                        "SELECT id FROM categories WHERE id = %s AND user_id = %s",
+                        (cat_id, user_id)
+                    )
                     if not cursor.fetchone():
                         return error_response('Category not found', 404)
                 updates.append("category_id = %s")
@@ -246,8 +275,9 @@ def update_recurring(item_id):
             
             updates.append("updated_at = CURRENT_TIMESTAMP")
             params.append(item_id)
+            params.append(user_id)  # Enforce ownership
             
-            query = f"UPDATE recurring_expenses SET {', '.join(updates)} WHERE id = %s"
+            query = f"UPDATE recurring_expenses SET {', '.join(updates)} WHERE id = %s AND user_id = %s"
             cursor.execute(query, params)
             db.commit()
             
@@ -259,8 +289,8 @@ def update_recurring(item_id):
                     c.name as category_name
                 FROM recurring_expenses r
                 LEFT JOIN categories c ON r.category_id = c.id
-                WHERE r.id = %s
-            """, (item_id,))
+                WHERE r.id = %s AND r.user_id = %s
+            """, (item_id, user_id))
             item = cursor.fetchone()
             
         return jsonify(format_recurring(item)), 200
@@ -270,11 +300,14 @@ def update_recurring(item_id):
         return handle_db_error(e)
 
 @recurring_bp.route('/<item_id>', methods=['DELETE'])
+@require_auth
 def delete_recurring(item_id):
     """
     DELETE /recurring/<item_id>
-    Delete a recurring expense.
+    Delete a recurring expense (must belong to authenticated user).
     """
+    user_id = get_current_user_id()
+    
     valid, error = validate_uuid(item_id)
     if not valid:
         return error_response(error, 400)
@@ -282,7 +315,11 @@ def delete_recurring(item_id):
     db = get_db()
     try:
         with db.cursor() as cursor:
-            cursor.execute("DELETE FROM recurring_expenses WHERE id = %s", (item_id,))
+            # Delete with ownership enforcement
+            cursor.execute(
+                "DELETE FROM recurring_expenses WHERE id = %s AND user_id = %s",
+                (item_id, user_id)
+            )
             if cursor.rowcount == 0:
                 return error_response('Recurring expense not found', 404)
             db.commit()

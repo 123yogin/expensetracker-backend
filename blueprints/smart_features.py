@@ -1,12 +1,9 @@
 """
 Smart Features Blueprint - Handles receipt photos, voice input, smart categorization, and export functionality.
 
-Features:
-- Receipt photo upload and management
-- Smart categorization based on learning patterns
-- Voice input processing
-- Export functionality (CSV, PDF)
-- Offline sync support
+Production-hardened endpoints with USER ISOLATION:
+- AUTHENTICATION REQUIRED: All endpoints require valid JWT
+- USER ISOLATION: Each user can only access their own data and preferences
 """
 
 import os
@@ -16,13 +13,14 @@ import csv
 import io
 from datetime import datetime, timedelta
 from werkzeug.utils import secure_filename
-from flask import Blueprint, request, jsonify, send_file
+from flask import Blueprint, request, jsonify, send_file, g
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
 from database import get_db
 from validators import validate_uuid, generate_uuid, format_amount
 from errors import handle_db_error, error_response
+from auth import require_auth, get_current_user_id
 
 smart_bp = Blueprint('smart', __name__, url_prefix='/smart')
 
@@ -62,19 +60,14 @@ def format_expense_with_receipt(row) -> dict:
 # ============================================================
 
 @smart_bp.route('/receipt/upload', methods=['POST'])
+@require_auth
 def upload_receipt():
     """
     POST /smart/receipt/upload
-    Upload a receipt photo.
-    
-    Form Data:
-        file: image file (required)
-        expense_id: UUID (optional, to associate with existing expense)
-    
-    Returns:
-        200: Upload success with file info
-        400: Validation error
+    Upload a receipt photo for the authenticated user.
     """
+    user_id = get_current_user_id()
+    
     if 'file' not in request.files:
         return error_response("No file provided", 400)
     
@@ -94,11 +87,11 @@ def upload_receipt():
         return error_response("File too large. Maximum size: 5MB", 400)
     
     try:
-        # Generate unique filename
+        # Generate unique filename with user_id prefix
         file_id = str(uuid.uuid4())
         original_filename = secure_filename(file.filename)
         file_extension = original_filename.rsplit('.', 1)[1].lower()
-        filename = f"{file_id}.{file_extension}"
+        filename = f"{user_id}_{file_id}.{file_extension}"
         filepath = os.path.join(UPLOAD_FOLDER, filename)
         
         # Save file
@@ -107,19 +100,21 @@ def upload_receipt():
         # Get expense_id if provided
         expense_id = request.form.get('expense_id')
         
-        # Update expense with receipt info if expense_id provided
-        if expense_id and validate_uuid(expense_id):
-            db = get_db()
-            with db.cursor() as cursor:
-                cursor.execute("""
-                    UPDATE expenses 
-                    SET receipt_photo_path = %s, 
-                        receipt_photo_filename = %s, 
-                        receipt_photo_size = %s,
-                        updated_at = CURRENT_TIMESTAMP
-                    WHERE id = %s
-                """, (filepath, original_filename, file_size, expense_id))
-                db.commit()
+        # Update expense with receipt info if expense_id provided (verify ownership)
+        if expense_id:
+            valid, error = validate_uuid(expense_id)
+            if valid:
+                db = get_db()
+                with db.cursor() as cursor:
+                    cursor.execute("""
+                        UPDATE expenses 
+                        SET receipt_photo_path = %s, 
+                            receipt_photo_filename = %s, 
+                            receipt_photo_size = %s,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE id = %s AND user_id = %s
+                    """, (filepath, original_filename, file_size, expense_id, user_id))
+                    db.commit()
         
         return jsonify({
             'success': True,
@@ -133,47 +128,49 @@ def upload_receipt():
     except Exception as e:
         return handle_db_error(e, "Failed to upload receipt")
 
+
 @smart_bp.route('/receipt/<file_id>', methods=['GET'])
+@require_auth
 def get_receipt(file_id):
     """
     GET /smart/receipt/{file_id}
-    Retrieve a receipt photo.
-    
-    Returns:
-        200: Image file
-        404: File not found
+    Retrieve a receipt photo (must belong to authenticated user).
     """
-    if not validate_uuid(file_id):
+    user_id = get_current_user_id()
+    
+    valid, error = validate_uuid(file_id)
+    if not valid:
         return error_response("Invalid file ID", 400)
     
-    # Find file with this ID
+    # Find file with this ID (user prefix ensures ownership)
     for ext in ALLOWED_EXTENSIONS:
-        filepath = os.path.join(UPLOAD_FOLDER, f"{file_id}.{ext}")
+        filepath = os.path.join(UPLOAD_FOLDER, f"{user_id}_{file_id}.{ext}")
         if os.path.exists(filepath):
             return send_file(filepath)
     
     return error_response("Receipt not found", 404)
 
+
 @smart_bp.route('/receipt/<file_id>', methods=['DELETE'])
+@require_auth
 def delete_receipt(file_id):
     """
     DELETE /smart/receipt/{file_id}
-    Delete a receipt photo.
-    
-    Returns:
-        204: Deleted successfully
-        404: File not found
+    Delete a receipt photo (must belong to authenticated user).
     """
-    if not validate_uuid(file_id):
+    user_id = get_current_user_id()
+    
+    valid, error = validate_uuid(file_id)
+    if not valid:
         return error_response("Invalid file ID", 400)
     
     try:
         db = get_db()
         deleted = False
         
-        # Find and delete file
+        # Find and delete file (user prefix ensures ownership)
         for ext in ALLOWED_EXTENSIONS:
-            filepath = os.path.join(UPLOAD_FOLDER, f"{file_id}.{ext}")
+            filepath = os.path.join(UPLOAD_FOLDER, f"{user_id}_{file_id}.{ext}")
             if os.path.exists(filepath):
                 os.remove(filepath)
                 deleted = True
@@ -186,8 +183,8 @@ def delete_receipt(file_id):
                             receipt_photo_filename = NULL, 
                             receipt_photo_size = NULL,
                             updated_at = CURRENT_TIMESTAMP
-                        WHERE receipt_photo_path = %s
-                    """, (filepath,))
+                        WHERE receipt_photo_path = %s AND user_id = %s
+                    """, (filepath, user_id))
                     db.commit()
                 break
         
@@ -199,23 +196,20 @@ def delete_receipt(file_id):
     except Exception as e:
         return handle_db_error(e, "Failed to delete receipt")
 
+
 # ============================================================
 # Smart Categorization
 # ============================================================
 
 @smart_bp.route('/categorization/suggest', methods=['POST'])
+@require_auth
 def suggest_category():
     """
     POST /smart/categorization/suggest
-    Suggest category based on note text using learned patterns.
-    
-    Body:
-        note: string (required)
-    
-    Returns:
-        200: Suggested category with confidence
-        400: Validation error
+    Suggest category based on note text using learned patterns for authenticated user.
     """
+    user_id = get_current_user_id()
+    
     data = request.get_json()
     note = data.get('note', '').strip().lower()
     
@@ -225,24 +219,23 @@ def suggest_category():
     try:
         db = get_db()
         with db.cursor(cursor_factory=RealDictCursor) as cursor:
-            # Find matching patterns using text search
+            # Find matching patterns for this user
             cursor.execute("""
                 SELECT cp.category_id, cp.confidence_score, cp.usage_count,
                        c.name as category_name
                 FROM categorization_patterns cp
                 JOIN categories c ON cp.category_id = c.id
-                WHERE c.is_active = TRUE
+                WHERE c.is_active = TRUE AND c.user_id = %s
                   AND to_tsvector('english', cp.note_keywords) @@ plainto_tsquery('english', %s)
                 ORDER BY cp.confidence_score DESC, cp.usage_count DESC
                 LIMIT 3
-            """, (note,))
+            """, (user_id, note))
             
             patterns = cursor.fetchall()
             
             if not patterns:
                 return jsonify({'suggestion': None, 'confidence': 0.0})
             
-            # Return best match
             best_match = patterns[0]
             return jsonify({
                 'suggestion': {
@@ -262,49 +255,52 @@ def suggest_category():
     except Exception as e:
         return handle_db_error(e, "Failed to suggest category")
 
+
 @smart_bp.route('/categorization/learn', methods=['POST'])
+@require_auth
 def learn_categorization():
     """
     POST /smart/categorization/learn
     Learn from user's categorization choice.
-    
-    Body:
-        note: string (required)
-        category_id: UUID (required)
-        confidence: float (optional, default 0.7)
-    
-    Returns:
-        200: Learning recorded
-        400: Validation error
     """
+    user_id = get_current_user_id()
+    
     data = request.get_json()
     
     note = data.get('note', '').strip().lower()
     category_id = data.get('category_id')
     confidence = data.get('confidence', 0.7)
     
-    if not note or not validate_uuid(category_id):
+    valid, error = validate_uuid(category_id)
+    if not note or not valid:
         return error_response("Note and valid category_id are required", 400)
     
     try:
         db = get_db()
         with db.cursor() as cursor:
-            # Extract keywords from note (simple approach)
+            # Verify category belongs to user
+            cursor.execute(
+                "SELECT id FROM categories WHERE id = %s AND user_id = %s",
+                (category_id, user_id)
+            )
+            if not cursor.fetchone():
+                return error_response("Category not found", 404)
+            
+            # Extract keywords from note
             keywords = ' '.join([word for word in note.split() if len(word) > 2])
             
-            # Check if pattern already exists
+            # Check if pattern already exists for this user
             cursor.execute("""
                 SELECT id, usage_count, confidence_score 
                 FROM categorization_patterns 
-                WHERE note_keywords = %s AND category_id = %s
-            """, (keywords, category_id))
+                WHERE note_keywords = %s AND category_id = %s AND user_id = %s
+            """, (keywords, category_id, user_id))
             
             existing = cursor.fetchone()
             
             if existing:
                 # Update existing pattern
                 new_usage_count = existing[1] + 1
-                # Increase confidence with more usage (max 0.95)
                 new_confidence = min(0.95, existing[2] + 0.05)
                 
                 cursor.execute("""
@@ -316,13 +312,13 @@ def learn_categorization():
                     WHERE id = %s
                 """, (new_usage_count, new_confidence, existing[0]))
             else:
-                # Create new pattern
+                # Create new pattern with user_id
                 pattern_id = generate_uuid()
                 cursor.execute("""
                     INSERT INTO categorization_patterns 
-                    (id, note_keywords, category_id, confidence_score)
-                    VALUES (%s, %s, %s, %s)
-                """, (pattern_id, keywords, category_id, confidence))
+                    (id, note_keywords, category_id, confidence_score, user_id)
+                    VALUES (%s, %s, %s, %s, %s)
+                """, (pattern_id, keywords, category_id, confidence, user_id))
             
             db.commit()
             return jsonify({'success': True, 'learned': True})
@@ -330,24 +326,20 @@ def learn_categorization():
     except Exception as e:
         return handle_db_error(e, "Failed to learn categorization")
 
+
 # ============================================================
 # Voice Input Processing
 # ============================================================
 
 @smart_bp.route('/voice/process', methods=['POST'])
+@require_auth
 def process_voice_input():
     """
     POST /smart/voice/process
-    Process voice input text and extract expense information.
-    
-    Body:
-        text: string (required) - transcribed voice text
-        confidence: float (optional) - voice recognition confidence
-    
-    Returns:
-        200: Parsed expense data
-        400: Validation error
+    Process voice input text and extract expense information for authenticated user.
     """
+    user_id = get_current_user_id()
+    
     data = request.get_json()
     text = data.get('text', '').strip().lower()
     confidence = data.get('confidence', 0.8)
@@ -356,7 +348,6 @@ def process_voice_input():
         return error_response("Voice text is required", 400)
     
     try:
-        # Simple voice parsing logic (can be enhanced with NLP)
         parsed_data = {
             'amount': None,
             'note': text,
@@ -365,10 +356,8 @@ def process_voice_input():
             'input_method': 'voice'
         }
         
-        # Extract amount using regex patterns
         import re
         
-        # Look for patterns like "spent 50", "paid 100", "₹200", "rupees 150"
         amount_patterns = [
             r'(?:spent|paid|cost|costs|costed)\s+(?:₹|rs\.?|rupees?)\s*(\d+(?:\.\d{2})?)',
             r'(?:spent|paid|cost|costs|costed)\s+(\d+(?:\.\d{2})?)\s*(?:₹|rs\.?|rupees?)',
@@ -383,18 +372,18 @@ def process_voice_input():
                 parsed_data['amount'] = match.group(1)
                 break
         
-        # Get category suggestion based on the text
+        # Get category suggestion for this user
         db = get_db()
         with db.cursor(cursor_factory=RealDictCursor) as cursor:
             cursor.execute("""
                 SELECT cp.category_id, c.name as category_name, cp.confidence_score
                 FROM categorization_patterns cp
                 JOIN categories c ON cp.category_id = c.id
-                WHERE c.is_active = TRUE
+                WHERE c.is_active = TRUE AND c.user_id = %s
                   AND to_tsvector('english', cp.note_keywords) @@ plainto_tsquery('english', %s)
                 ORDER BY cp.confidence_score DESC, cp.usage_count DESC
                 LIMIT 1
-            """, (text,))
+            """, (user_id, text))
             
             suggestion = cursor.fetchone()
             if suggestion:
@@ -409,25 +398,20 @@ def process_voice_input():
     except Exception as e:
         return handle_db_error(e, "Failed to process voice input")
 
+
 # ============================================================
 # Export Functionality
 # ============================================================
 
 @smart_bp.route('/export/csv', methods=['POST'])
+@require_auth
 def export_csv():
     """
     POST /smart/export/csv
-    Export expenses to CSV format.
-    
-    Body:
-        start_date: string (optional) - YYYY-MM-DD
-        end_date: string (optional) - YYYY-MM-DD
-        category_ids: array (optional) - filter by categories
-    
-    Returns:
-        200: CSV file download
-        400: Validation error
+    Export authenticated user's expenses to CSV format.
     """
+    user_id = get_current_user_id()
+    
     data = request.get_json() or {}
     
     start_date = data.get('start_date') or None
@@ -437,17 +421,16 @@ def export_csv():
     try:
         db = get_db()
         with db.cursor(cursor_factory=RealDictCursor) as cursor:
-            # Build query with filters
+            # Build query with user isolation
             query = """
                 SELECT e.date, e.amount, c.name as category, e.note,
                        e.is_split, e.split_amount, e.split_with,
-                       e.input_method, e.receipt_photo_filename,
                        e.created_at
                 FROM expenses e
                 JOIN categories c ON e.category_id = c.id
-                WHERE 1=1
+                WHERE e.user_id = %s
             """
-            params = []
+            params = [user_id]
             
             if start_date:
                 query += " AND e.date >= %s"
@@ -471,14 +454,11 @@ def export_csv():
             output = io.StringIO()
             writer = csv.writer(output)
             
-            # Write header
             writer.writerow([
                 'Date', 'Amount (₹)', 'Category', 'Note', 
-                'Is Split', 'Split Amount (₹)', 'Split With',
-                'Input Method', 'Has Receipt', 'Created At'
+                'Is Split', 'Split Amount (₹)', 'Split With', 'Created At'
             ])
             
-            # Write data
             for expense in expenses:
                 writer.writerow([
                     expense['date'],
@@ -488,25 +468,21 @@ def export_csv():
                     'Yes' if expense['is_split'] else 'No',
                     format_amount(expense['split_amount']) if expense['split_amount'] else '',
                     expense['split_with'] or '',
-                    expense['input_method'] or 'manual',
-                    'Yes' if expense['receipt_photo_filename'] else 'No',
                     expense['created_at']
                 ])
             
-            # Log export
+            # Log export with user_id
             export_id = generate_uuid()
             cursor.execute("""
-                INSERT INTO export_logs (id, export_type, date_range_start, date_range_end, total_records)
-                VALUES (%s, 'csv', %s, %s, %s)
-            """, (export_id, start_date, end_date, len(expenses)))
+                INSERT INTO export_logs (id, export_type, date_range_start, date_range_end, total_records, user_id)
+                VALUES (%s, 'csv', %s, %s, %s, %s)
+            """, (export_id, start_date, end_date, len(expenses), user_id))
             db.commit()
             
-            # Prepare file response
             output.seek(0)
             csv_data = output.getvalue()
             output.close()
             
-            # Create file-like object for send_file
             csv_buffer = io.BytesIO(csv_data.encode('utf-8'))
             csv_buffer.seek(0)
             
@@ -522,21 +498,16 @@ def export_csv():
     except Exception as e:
         return handle_db_error(e, "Failed to export CSV")
 
+
 @smart_bp.route('/export/pdf', methods=['POST'])
+@require_auth
 def export_pdf():
     """
     POST /smart/export/pdf
-    Export expenses to PDF format.
-    
-    Body:
-        start_date: string (optional) - YYYY-MM-DD
-        end_date: string (optional) - YYYY-MM-DD
-        category_ids: array (optional) - filter by categories
-    
-    Returns:
-        200: PDF file download
-        400: Validation error
+    Export authenticated user's expenses to PDF format.
     """
+    user_id = get_current_user_id()
+    
     data = request.get_json() or {}
     
     start_date = data.get('start_date') or None
@@ -544,23 +515,21 @@ def export_pdf():
     category_ids = data.get('category_ids', [])
     
     try:
-        # Lazy import reportlab to allow app startup if missing (though it should be installed)
         from reportlab.lib import colors
         from reportlab.lib.pagesizes import letter
         from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
-        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        from reportlab.lib.styles import getSampleStyleSheet
         
         db = get_db()
         with db.cursor(cursor_factory=RealDictCursor) as cursor:
-            # Re-use the same query logic as CSV export
             query = """
                 SELECT e.date, e.amount, c.name as category, e.note,
                        e.is_split, e.split_amount
                 FROM expenses e
                 JOIN categories c ON e.category_id = c.id
-                WHERE 1=1
+                WHERE e.user_id = %s
             """
-            params = []
+            params = [user_id]
             
             if start_date:
                 query += " AND e.date >= %s"
@@ -580,23 +549,19 @@ def export_pdf():
             cursor.execute(query, params)
             expenses = cursor.fetchall()
             
-            # Create PDF Buffer
             buffer = io.BytesIO()
             doc = SimpleDocTemplate(buffer, pagesize=letter)
             elements = []
             
-            # Styles
             styles = getSampleStyleSheet()
             title_style = styles['Title']
             
-            # Title
             title_text = "Expense Report"
             if start_date and end_date:
                 title_text += f" ({start_date} to {end_date})"
             elements.append(Paragraph(title_text, title_style))
             elements.append(Spacer(1, 20))
             
-            # Table Data
             table_data = [['Date', 'Category', 'Note', 'Amount', 'Split?']]
             
             total_amount = 0
@@ -617,10 +582,8 @@ def export_pdf():
                     'Yes' if exp['is_split'] else 'No'
                 ])
             
-            # Add Total Row
             table_data.append(['', '', 'Total', f"₹{format_amount(total_amount)}", ''])
             
-            # Table Formatting
             table = Table(table_data, colWidths=[80, 100, 180, 80, 50])
             table.setStyle(TableStyle([
                 ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
@@ -630,24 +593,21 @@ def export_pdf():
                 ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
                 ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
                 ('GRID', (0, 0), (-1, -2), 1, colors.black),
-                ('FONTNAME', (0, -1), (-1, -1), 'Helvetica-Bold'), # Total row bold
-                ('LINEABOVE', (0, -1), (-1, -1), 2, colors.black), # Line above total
+                ('FONTNAME', (0, -1), (-1, -1), 'Helvetica-Bold'),
+                ('LINEABOVE', (0, -1), (-1, -1), 2, colors.black),
             ]))
             
             elements.append(table)
-            
-            # Build PDF
             doc.build(elements)
             
-            # Log export
+            # Log export with user_id
             export_id = generate_uuid()
             cursor.execute("""
-                INSERT INTO export_logs (id, export_type, date_range_start, date_range_end, total_records)
-                VALUES (%s, 'pdf', %s, %s, %s)
-            """, (export_id, start_date, end_date, len(expenses)))
+                INSERT INTO export_logs (id, export_type, date_range_start, date_range_end, total_records, user_id)
+                VALUES (%s, 'pdf', %s, %s, %s, %s)
+            """, (export_id, start_date, end_date, len(expenses), user_id))
             db.commit()
             
-            # Return file
             buffer.seek(0)
             filename = f"expenses_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
             
@@ -663,28 +623,30 @@ def export_pdf():
     except Exception as e:
         return handle_db_error(e, "Failed to export PDF")
 
+
 @smart_bp.route('/export/summary', methods=['GET'])
+@require_auth
 def export_summary():
     """
     GET /smart/export/summary
-    Get export history and statistics.
-    
-    Returns:
-        200: Export summary data
+    Get export history and statistics for authenticated user.
     """
+    user_id = get_current_user_id()
+    
     try:
         db = get_db()
         with db.cursor(cursor_factory=RealDictCursor) as cursor:
-            # Get recent exports
+            # Get user's recent exports
             cursor.execute("""
                 SELECT export_type, total_records, created_at
                 FROM export_logs
+                WHERE user_id = %s
                 ORDER BY created_at DESC
                 LIMIT 10
-            """)
+            """, (user_id,))
             recent_exports = cursor.fetchall()
             
-            # Get export statistics
+            # Get user's export statistics
             cursor.execute("""
                 SELECT 
                     export_type,
@@ -692,8 +654,9 @@ def export_summary():
                     SUM(total_records) as total_records_exported,
                     MAX(created_at) as last_export
                 FROM export_logs
+                WHERE user_id = %s
                 GROUP BY export_type
-            """)
+            """, (user_id,))
             stats = cursor.fetchall()
             
             return jsonify({
@@ -717,26 +680,28 @@ def export_summary():
     except Exception as e:
         return handle_db_error(e, "Failed to get export summary")
 
+
 # ============================================================
 # User Preferences
 # ============================================================
 
 @smart_bp.route('/preferences', methods=['GET'])
+@require_auth
 def get_preferences():
     """
     GET /smart/preferences
     Get user preferences for smart features.
-    
-    Returns:
-        200: User preferences object
     """
+    user_id = get_current_user_id()
+    
     try:
         db = get_db()
         with db.cursor(cursor_factory=RealDictCursor) as cursor:
             cursor.execute("""
                 SELECT preference_key, preference_value
                 FROM user_preferences
-            """)
+                WHERE user_id = %s
+            """, (user_id,))
             
             preferences = {}
             for row in cursor.fetchall():
@@ -747,19 +712,16 @@ def get_preferences():
     except Exception as e:
         return handle_db_error(e, "Failed to get preferences")
 
+
 @smart_bp.route('/preferences', methods=['PUT'])
+@require_auth
 def update_preferences():
     """
     PUT /smart/preferences
     Update user preferences.
-    
-    Body:
-        preferences: object with preference keys and values
-    
-    Returns:
-        200: Updated preferences
-        400: Validation error
     """
+    user_id = get_current_user_id()
+    
     data = request.get_json()
     preferences = data.get('preferences', {})
     
@@ -771,13 +733,13 @@ def update_preferences():
         with db.cursor() as cursor:
             for key, value in preferences.items():
                 cursor.execute("""
-                    INSERT INTO user_preferences (id, preference_key, preference_value)
-                    VALUES (%s, %s, %s)
-                    ON CONFLICT (preference_key) 
+                    INSERT INTO user_preferences (id, preference_key, preference_value, user_id)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (preference_key, user_id) 
                     DO UPDATE SET 
                         preference_value = EXCLUDED.preference_value,
                         updated_at = CURRENT_TIMESTAMP
-                """, (generate_uuid(), key, json.dumps(value)))
+                """, (generate_uuid(), key, json.dumps(value), user_id))
             
             db.commit()
             return jsonify({'success': True, 'updated': len(preferences)})

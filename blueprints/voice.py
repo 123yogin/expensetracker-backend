@@ -1,31 +1,30 @@
 """
 Voice Input Blueprint - Handles voice-to-expense conversion.
 
-Features:
-- Voice transcript processing
-- Natural language parsing for expenses
-- Voice session tracking
-- Integration with smart categorization
+Production-hardened endpoints with USER ISOLATION:
+- AUTHENTICATION REQUIRED: All endpoints require valid JWT
+- USER ISOLATION: Each user can only access their own voice sessions
 """
 
 import re
 import json
 from datetime import datetime, date
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request, jsonify, g
 
 from database import get_db
 from validators import validate_uuid, generate_uuid, validate_amount
 from errors import handle_db_error, error_response
+from auth import require_auth, get_current_user_id
 
 voice_bp = Blueprint('voice', __name__, url_prefix='/voice')
 
+
 def parse_amount(text):
     """Extract amount from text."""
-    # Look for patterns like: $50, 50 dollars, 50.99, fifty dollars
     amount_patterns = [
-        r'\$(\d+(?:\.\d{2})?)',  # $50.99
-        r'(\d+(?:\.\d{2})?)\s*(?:dollars?|bucks?|rupees?|rs\.?)',  # 50 dollars
-        r'(\d+(?:\.\d{2})?)',  # Just numbers
+        r'\$(\d+(?:\.\d{2})?)',
+        r'(\d+(?:\.\d{2})?)\s*(?:dollars?|bucks?|rupees?|rs\.?)',
+        r'(\d+(?:\.\d{2})?)',
     ]
     
     for pattern in amount_patterns:
@@ -36,7 +35,6 @@ def parse_amount(text):
             except (ValueError, IndexError):
                 continue
     
-    # Try to parse written numbers (basic)
     number_words = {
         'zero': 0, 'one': 1, 'two': 2, 'three': 3, 'four': 4, 'five': 5,
         'six': 6, 'seven': 7, 'eight': 8, 'nine': 9, 'ten': 10,
@@ -50,12 +48,12 @@ def parse_amount(text):
     for i, word in enumerate(words):
         if word in number_words:
             amount = number_words[word]
-            # Check for "hundred" modifier
             if i + 1 < len(words) and words[i + 1] == 'hundred':
                 amount *= 100
             return float(amount)
     
     return None
+
 
 def parse_category_keywords(text):
     """Extract category hints from text."""
@@ -79,14 +77,13 @@ def parse_category_keywords(text):
     
     return None
 
+
 def extract_note(text, amount_text=None):
     """Extract the descriptive note from text, removing amount references."""
-    # Remove common amount patterns
     cleaned = text
     if amount_text:
         cleaned = cleaned.replace(amount_text, '').strip()
     
-    # Remove common voice command prefixes
     prefixes = [
         'i spent', 'spent', 'paid', 'bought', 'purchase', 'add expense',
         'expense for', 'expense of', 'record expense', 'track expense'
@@ -98,25 +95,21 @@ def extract_note(text, amount_text=None):
             cleaned = cleaned[len(prefix):].strip()
             break
     
-    # Remove currency symbols and amount patterns
     cleaned = re.sub(r'\$\d+(?:\.\d{2})?', '', cleaned)
     cleaned = re.sub(r'\d+(?:\.\d{2})?\s*(?:dollars?|bucks?|rupees?|rs\.?)', '', cleaned)
     
     return cleaned.strip()
 
+
 @voice_bp.route('/process', methods=['POST'])
+@require_auth
 def process_voice_input():
     """
     POST /voice/process
-    Process voice transcript and extract expense information.
-    
-    Body:
-        transcript: string (required)
-        confidence: decimal (optional, speech recognition confidence)
-    
-    Returns:
-        200: Parsed expense information
+    Process voice transcript and extract expense information for authenticated user.
     """
+    user_id = get_current_user_id()
+    
     data = request.get_json()
     transcript = data.get('transcript', '').strip()
     speech_confidence = data.get('confidence', 1.0)
@@ -124,28 +117,26 @@ def process_voice_input():
     if not transcript:
         return error_response("Transcript is required", 400)
     
-    # Parse the transcript
     parsed_amount = parse_amount(transcript)
     category_hint = parse_category_keywords(transcript)
     note = extract_note(transcript)
     
-    # Calculate overall confidence
     confidence = speech_confidence
     if parsed_amount is None:
-        confidence *= 0.5  # Lower confidence if no amount found
+        confidence *= 0.5
     if not category_hint:
-        confidence *= 0.8  # Slightly lower if no category hint
+        confidence *= 0.8
     
     db = get_db()
     try:
         with db.cursor() as cursor:
-            # Save voice session
+            # Save voice session with user_id
             session_id = generate_uuid()
             cursor.execute("""
                 INSERT INTO voice_sessions 
-                (id, transcript, parsed_amount, parsed_category, parsed_note, confidence_score)
-                VALUES (%s, %s, %s, %s, %s, %s)
-            """, (session_id, transcript, parsed_amount, category_hint, note, confidence))
+                (id, transcript, parsed_amount, parsed_category, parsed_note, confidence_score, user_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """, (session_id, transcript, parsed_amount, category_hint, note, confidence, user_id))
             
             db.commit()
             
@@ -161,20 +152,17 @@ def process_voice_input():
                 'suggestions': []
             }
             
-            # Get category suggestions if we have a note
+            # Get category suggestions for this user
             if note:
-                # Import here to avoid circular imports
-                from blueprints.smart_categorization import suggest_category
                 try:
-                    # Get smart category suggestions
                     cursor.execute("""
                         SELECT cp.category_id, c.name as category_name, cp.confidence_score
                         FROM categorization_patterns cp
                         JOIN categories c ON cp.category_id = c.id
-                        WHERE c.is_active = TRUE
+                        WHERE c.is_active = TRUE AND c.user_id = %s
                         ORDER BY cp.usage_count DESC, cp.confidence_score DESC
                         LIMIT 3
-                    """)
+                    """, (user_id,))
                     
                     for row in cursor.fetchall():
                         result['suggestions'].append({
@@ -184,29 +172,23 @@ def process_voice_input():
                             'source': 'smart_categorization'
                         })
                 except:
-                    pass  # Fallback gracefully
+                    pass
             
             return jsonify(result)
             
     except Exception as e:
         return handle_db_error(e, "Failed to process voice input")
 
+
 @voice_bp.route('/create-expense', methods=['POST'])
+@require_auth
 def create_expense_from_voice():
     """
     POST /voice/create-expense
-    Create expense from voice session.
-    
-    Body:
-        session_id: UUID (required)
-        amount: decimal (required)
-        category_id: UUID (required)
-        note: string (optional)
-        date: string (optional, defaults to today)
-    
-    Returns:
-        201: Created expense
+    Create expense from voice session (must belong to authenticated user).
     """
+    user_id = get_current_user_id()
+    
     data = request.get_json()
     session_id = data.get('session_id')
     amount = data.get('amount')
@@ -214,7 +196,8 @@ def create_expense_from_voice():
     note = data.get('note', '').strip()
     expense_date = data.get('date', str(date.today()))
     
-    if not validate_uuid(session_id):
+    valid, error = validate_uuid(session_id)
+    if not valid:
         return error_response("Valid session_id is required", 400)
     
     if not amount:
@@ -224,49 +207,57 @@ def create_expense_from_voice():
     if not valid:
         return error_response(error, 400)
     
-    if not validate_uuid(category_id):
+    valid, error = validate_uuid(category_id)
+    if not valid:
         return error_response("Valid category_id is required", 400)
     
     db = get_db()
     try:
         with db.cursor() as cursor:
-            # Check if voice session exists
-            cursor.execute("SELECT id FROM voice_sessions WHERE id = %s", (session_id,))
+            # Check if voice session exists and belongs to user
+            cursor.execute(
+                "SELECT id FROM voice_sessions WHERE id = %s AND user_id = %s",
+                (session_id, user_id)
+            )
             if not cursor.fetchone():
                 return error_response("Voice session not found", 404)
             
-            # Check if category exists
-            cursor.execute("SELECT id FROM categories WHERE id = %s AND is_active = TRUE", (category_id,))
+            # Check if category exists and belongs to user
+            cursor.execute(
+                "SELECT id FROM categories WHERE id = %s AND is_active = TRUE AND user_id = %s",
+                (category_id, user_id)
+            )
             if not cursor.fetchone():
                 return error_response("Category not found or inactive", 404)
             
-            # Create expense
+            # Create expense with user_id
             expense_id = generate_uuid()
             cursor.execute("""
-                INSERT INTO expenses (id, date, amount, category_id, note, created_via_voice)
-                VALUES (%s, %s, %s, %s, %s, TRUE)
-            """, (expense_id, expense_date, amount, category_id, note))
+                INSERT INTO expenses (id, date, amount, category_id, note, created_via_voice, user_id)
+                VALUES (%s, %s, %s, %s, %s, TRUE, %s)
+            """, (expense_id, expense_date, amount, category_id, note, user_id))
             
             # Update voice session with created expense
             cursor.execute("""
                 UPDATE voice_sessions 
                 SET created_expense_id = %s
-                WHERE id = %s
-            """, (expense_id, session_id))
+                WHERE id = %s AND user_id = %s
+            """, (expense_id, session_id, user_id))
             
-            # Learn from this categorization for smart suggestions
+            # Learn from this categorization
             if note:
                 try:
+                    pattern_id = generate_uuid()
                     cursor.execute("""
                         INSERT INTO categorization_patterns 
-                        (id, note_pattern, category_id, confidence_score, usage_count)
-                        VALUES (%s, %s, %s, 0.8, 1)
+                        (id, note_pattern, category_id, confidence_score, usage_count, user_id)
+                        VALUES (%s, %s, %s, 0.8, 1, %s)
                         ON CONFLICT (note_pattern, category_id) DO UPDATE SET
                         usage_count = categorization_patterns.usage_count + 1,
                         last_used = CURRENT_TIMESTAMP
-                    """, (generate_uuid(), note.lower().strip(), category_id))
+                    """, (pattern_id, note.lower().strip(), category_id, user_id))
                 except:
-                    pass  # Ignore conflicts
+                    pass
             
             # Fetch created expense with category name
             cursor.execute("""
@@ -274,8 +265,8 @@ def create_expense_from_voice():
                        e.created_at, e.created_via_voice, c.name as category_name
                 FROM expenses e
                 JOIN categories c ON e.category_id = c.id
-                WHERE e.id = %s
-            """, (expense_id,))
+                WHERE e.id = %s AND e.user_id = %s
+            """, (expense_id, user_id))
             
             row = cursor.fetchone()
             expense = {
@@ -295,19 +286,16 @@ def create_expense_from_voice():
     except Exception as e:
         return handle_db_error(e, "Failed to create expense from voice")
 
+
 @voice_bp.route('/sessions', methods=['GET'])
+@require_auth
 def get_voice_sessions():
     """
     GET /voice/sessions
-    Get voice input sessions.
-    
-    Query Parameters:
-        limit: integer (optional, default 20)
-        processed: boolean (optional, filter by processed status)
-    
-    Returns:
-        200: List of voice sessions
+    Get voice input sessions for authenticated user.
     """
+    user_id = get_current_user_id()
+    
     limit = min(int(request.args.get('limit', 20)), 100)
     processed = request.args.get('processed')
     
@@ -322,9 +310,9 @@ def get_voice_sessions():
                 FROM voice_sessions vs
                 LEFT JOIN expenses e ON vs.created_expense_id = e.id
                 LEFT JOIN categories c ON e.category_id = c.id
-                WHERE 1=1
+                WHERE vs.user_id = %s
             """
-            params = []
+            params = [user_id]
             
             if processed is not None:
                 if processed.lower() == 'true':
@@ -360,23 +348,27 @@ def get_voice_sessions():
     except Exception as e:
         return handle_db_error(e, "Failed to fetch voice sessions")
 
+
 @voice_bp.route('/sessions/<session_id>', methods=['DELETE'])
+@require_auth
 def delete_voice_session(session_id):
     """
     DELETE /voice/sessions/{id}
-    Delete a voice session.
-    
-    Returns:
-        204: Session deleted
-        404: Session not found
+    Delete a voice session (must belong to authenticated user).
     """
-    if not validate_uuid(session_id):
+    user_id = get_current_user_id()
+    
+    valid, error = validate_uuid(session_id)
+    if not valid:
         return error_response("Invalid session ID", 400)
     
     db = get_db()
     try:
         with db.cursor() as cursor:
-            cursor.execute("DELETE FROM voice_sessions WHERE id = %s", (session_id,))
+            cursor.execute(
+                "DELETE FROM voice_sessions WHERE id = %s AND user_id = %s",
+                (session_id, user_id)
+            )
             
             if cursor.rowcount == 0:
                 return error_response("Voice session not found", 404)

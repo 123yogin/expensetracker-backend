@@ -1,37 +1,37 @@
 """
 Smart Categorization Blueprint - Handles AI-powered expense categorization.
 
-Features:
-- Learn from user categorization patterns
-- Suggest categories based on expense notes
-- Pattern matching and confidence scoring
-- Offline-capable smart suggestions
+Production-hardened endpoints with USER ISOLATION:
+- AUTHENTICATION REQUIRED: All endpoints require valid JWT
+- USER ISOLATION: Each user can only access their own patterns
 """
 
 import re
 import json
 from datetime import datetime, timedelta
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request, jsonify, g
 
 from database import get_db
 from validators import validate_uuid, generate_uuid
 from errors import handle_db_error, error_response
+from auth import require_auth, get_current_user_id
 
-smart_bp = Blueprint('smart', __name__, url_prefix='/smart')
+# Changed blueprint name to avoid conflict with smart_features.py
+smart_categorization_bp = Blueprint('smart_categorization', __name__, url_prefix='/smart-categorization')
+
 
 def normalize_text(text):
     """Normalize text for pattern matching."""
     if not text:
         return ""
-    # Convert to lowercase, remove extra spaces, keep alphanumeric and spaces
     return re.sub(r'[^a-zA-Z0-9\s]', ' ', text.lower()).strip()
+
 
 def extract_keywords(text):
     """Extract meaningful keywords from text."""
     if not text:
         return []
     
-    # Common stop words to ignore
     stop_words = {
         'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for',
         'of', 'with', 'by', 'from', 'up', 'about', 'into', 'through', 'during',
@@ -43,7 +43,8 @@ def extract_keywords(text):
     normalized = normalize_text(text)
     words = normalized.split()
     keywords = [word for word in words if len(word) > 2 and word not in stop_words]
-    return keywords[:5]  # Return top 5 keywords
+    return keywords[:5]
+
 
 def calculate_similarity(text1, text2):
     """Calculate similarity between two texts based on common keywords."""
@@ -58,19 +59,16 @@ def calculate_similarity(text1, text2):
     
     return len(intersection) / len(union) if union else 0.0
 
-@smart_bp.route('/suggest-category', methods=['POST'])
+
+@smart_categorization_bp.route('/suggest-category', methods=['POST'])
+@require_auth
 def suggest_category():
     """
-    POST /smart/suggest-category
-    Suggest category based on expense note.
-    
-    Body:
-        note: string (required)
-        amount: decimal (optional, for context)
-    
-    Returns:
-        200: Category suggestions with confidence scores
+    POST /smart-categorization/suggest-category
+    Suggest category based on expense note for authenticated user.
     """
+    user_id = get_current_user_id()
+    
     data = request.get_json()
     note = data.get('note', '').strip()
     amount = data.get('amount')
@@ -81,24 +79,22 @@ def suggest_category():
     db = get_db()
     try:
         with db.cursor() as cursor:
-            # Get all categorization patterns
+            # Get user's categorization patterns
             cursor.execute("""
                 SELECT cp.note_pattern, cp.category_id, cp.confidence_score, 
                        cp.usage_count, c.name as category_name
                 FROM categorization_patterns cp
                 JOIN categories c ON cp.category_id = c.id
-                WHERE c.is_active = TRUE
+                WHERE c.is_active = TRUE AND c.user_id = %s
                 ORDER BY cp.usage_count DESC, cp.confidence_score DESC
-            """)
+            """, (user_id,))
             
             patterns = cursor.fetchall()
             suggestions = []
             
-            # Calculate similarity scores
             for pattern in patterns:
                 similarity = calculate_similarity(note, pattern['note_pattern'])
-                if similarity > 0.1:  # Minimum threshold
-                    # Boost confidence based on usage count
+                if similarity > 0.1:
                     usage_boost = min(pattern['usage_count'] / 10.0, 0.3)
                     final_confidence = min(similarity + usage_boost, 1.0)
                     
@@ -109,13 +105,11 @@ def suggest_category():
                         'reason': f"Similar to: {pattern['note_pattern'][:50]}..."
                     })
             
-            # Sort by confidence and limit to top 3
             suggestions.sort(key=lambda x: x['confidence'], reverse=True)
             suggestions = suggestions[:3]
             
-            # If no good matches, provide fallback suggestions based on keywords
             if not suggestions:
-                fallback_suggestions = get_fallback_suggestions(note, cursor)
+                fallback_suggestions = get_fallback_suggestions(note, cursor, user_id)
                 suggestions.extend(fallback_suggestions)
             
             return jsonify({'suggestions': suggestions})
@@ -123,13 +117,13 @@ def suggest_category():
     except Exception as e:
         return handle_db_error(e, "Failed to suggest category")
 
-def get_fallback_suggestions(note, cursor):
+
+def get_fallback_suggestions(note, cursor, user_id):
     """Get fallback category suggestions based on common keywords."""
     keywords = extract_keywords(note)
     if not keywords:
         return []
     
-    # Common keyword-to-category mappings
     keyword_mappings = {
         'food': ['Food & Dining', 'Groceries', 'Restaurant'],
         'gas': ['Transportation', 'Fuel'],
@@ -168,12 +162,12 @@ def get_fallback_suggestions(note, cursor):
     for keyword in keywords:
         if keyword in keyword_mappings:
             for category_name in keyword_mappings[keyword]:
-                # Check if category exists
+                # Check if user's category exists
                 cursor.execute("""
                     SELECT id, name FROM categories 
-                    WHERE LOWER(name) LIKE %s AND is_active = TRUE
+                    WHERE LOWER(name) LIKE %s AND is_active = TRUE AND user_id = %s
                     LIMIT 1
-                """, (f'%{category_name.lower()}%',))
+                """, (f'%{category_name.lower()}%', user_id))
                 
                 row = cursor.fetchone()
                 if row:
@@ -185,7 +179,6 @@ def get_fallback_suggestions(note, cursor):
                     })
                     break
     
-    # Remove duplicates and limit
     seen = set()
     unique_suggestions = []
     for suggestion in suggestions:
@@ -195,20 +188,16 @@ def get_fallback_suggestions(note, cursor):
     
     return unique_suggestions[:2]
 
-@smart_bp.route('/learn-pattern', methods=['POST'])
+
+@smart_categorization_bp.route('/learn-pattern', methods=['POST'])
+@require_auth
 def learn_pattern():
     """
-    POST /smart/learn-pattern
+    POST /smart-categorization/learn-pattern
     Learn from user categorization choice.
-    
-    Body:
-        note: string (required)
-        category_id: UUID (required)
-        confidence: decimal (optional, default 1.0)
-    
-    Returns:
-        201: Pattern learned successfully
     """
+    user_id = get_current_user_id()
+    
     data = request.get_json()
     note = data.get('note', '').strip()
     category_id = data.get('category_id')
@@ -217,7 +206,8 @@ def learn_pattern():
     if not note:
         return error_response("Note is required", 400)
     
-    if not validate_uuid(category_id):
+    valid, error = validate_uuid(category_id)
+    if not valid:
         return error_response("Valid category_id is required", 400)
     
     if not (0.0 <= confidence <= 1.0):
@@ -226,23 +216,25 @@ def learn_pattern():
     db = get_db()
     try:
         with db.cursor() as cursor:
-            # Check if category exists
-            cursor.execute("SELECT id FROM categories WHERE id = %s AND is_active = TRUE", (category_id,))
+            # Check if category exists and belongs to user
+            cursor.execute(
+                "SELECT id FROM categories WHERE id = %s AND is_active = TRUE AND user_id = %s",
+                (category_id, user_id)
+            )
             if not cursor.fetchone():
                 return error_response("Category not found or inactive", 404)
             
             normalized_note = normalize_text(note)
             
-            # Check if similar pattern already exists
+            # Check if similar pattern already exists for this user
             cursor.execute("""
                 SELECT id, usage_count FROM categorization_patterns
-                WHERE note_pattern = %s AND category_id = %s
-            """, (normalized_note, category_id))
+                WHERE note_pattern = %s AND category_id = %s AND user_id = %s
+            """, (normalized_note, category_id, user_id))
             
             existing = cursor.fetchone()
             
             if existing:
-                # Update existing pattern
                 cursor.execute("""
                     UPDATE categorization_patterns
                     SET usage_count = usage_count + 1,
@@ -251,13 +243,12 @@ def learn_pattern():
                     WHERE id = %s
                 """, (confidence, existing['id']))
             else:
-                # Create new pattern
                 pattern_id = generate_uuid()
                 cursor.execute("""
                     INSERT INTO categorization_patterns
-                    (id, note_pattern, category_id, confidence_score, usage_count)
-                    VALUES (%s, %s, %s, %s, 1)
-                """, (pattern_id, normalized_note, category_id, confidence))
+                    (id, note_pattern, category_id, confidence_score, usage_count, user_id)
+                    VALUES (%s, %s, %s, %s, 1, %s)
+                """, (pattern_id, normalized_note, category_id, confidence, user_id))
             
             db.commit()
             return jsonify({'message': 'Pattern learned successfully'}), 201
@@ -265,24 +256,23 @@ def learn_pattern():
     except Exception as e:
         return handle_db_error(e, "Failed to learn pattern")
 
-@smart_bp.route('/patterns', methods=['GET'])
+
+@smart_categorization_bp.route('/patterns', methods=['GET'])
+@require_auth
 def get_patterns():
     """
-    GET /smart/patterns
-    Get all learned categorization patterns.
-    
-    Query Parameters:
-        category_id: UUID (optional, filter by category)
-        limit: integer (optional, default 50)
-    
-    Returns:
-        200: List of patterns
+    GET /smart-categorization/patterns
+    Get all learned categorization patterns for authenticated user.
     """
-    category_id = request.args.get('category_id')
-    limit = min(int(request.args.get('limit', 50)), 100)  # Max 100
+    user_id = get_current_user_id()
     
-    if category_id and not validate_uuid(category_id):
-        return error_response("Invalid category_id", 400)
+    category_id = request.args.get('category_id')
+    limit = min(int(request.args.get('limit', 50)), 100)
+    
+    if category_id:
+        valid, error = validate_uuid(category_id)
+        if not valid:
+            return error_response("Invalid category_id", 400)
     
     db = get_db()
     try:
@@ -293,9 +283,9 @@ def get_patterns():
                        c.name as category_name
                 FROM categorization_patterns cp
                 JOIN categories c ON cp.category_id = c.id
-                WHERE c.is_active = TRUE
+                WHERE c.is_active = TRUE AND cp.user_id = %s
             """
-            params = []
+            params = [user_id]
             
             if category_id:
                 query += " AND cp.category_id = %s"
@@ -324,23 +314,27 @@ def get_patterns():
     except Exception as e:
         return handle_db_error(e, "Failed to fetch patterns")
 
-@smart_bp.route('/patterns/<pattern_id>', methods=['DELETE'])
+
+@smart_categorization_bp.route('/patterns/<pattern_id>', methods=['DELETE'])
+@require_auth
 def delete_pattern(pattern_id):
     """
-    DELETE /smart/patterns/{id}
-    Delete a learned pattern.
-    
-    Returns:
-        204: Pattern deleted
-        404: Pattern not found
+    DELETE /smart-categorization/patterns/{id}
+    Delete a learned pattern (must belong to authenticated user).
     """
-    if not validate_uuid(pattern_id):
+    user_id = get_current_user_id()
+    
+    valid, error = validate_uuid(pattern_id)
+    if not valid:
         return error_response("Invalid pattern ID", 400)
     
     db = get_db()
     try:
         with db.cursor() as cursor:
-            cursor.execute("DELETE FROM categorization_patterns WHERE id = %s", (pattern_id,))
+            cursor.execute(
+                "DELETE FROM categorization_patterns WHERE id = %s AND user_id = %s",
+                (pattern_id, user_id)
+            )
             
             if cursor.rowcount == 0:
                 return error_response("Pattern not found", 404)
@@ -351,20 +345,16 @@ def delete_pattern(pattern_id):
     except Exception as e:
         return handle_db_error(e, "Failed to delete pattern")
 
-@smart_bp.route('/cleanup-patterns', methods=['POST'])
+
+@smart_categorization_bp.route('/cleanup-patterns', methods=['POST'])
+@require_auth
 def cleanup_patterns():
     """
-    POST /smart/cleanup-patterns
-    Clean up old or low-confidence patterns.
-    
-    Body:
-        days_old: integer (optional, default 90)
-        min_confidence: decimal (optional, default 0.3)
-        min_usage: integer (optional, default 2)
-    
-    Returns:
-        200: Cleanup completed with count
+    POST /smart-categorization/cleanup-patterns
+    Clean up old or low-confidence patterns for authenticated user.
     """
+    user_id = get_current_user_id()
+    
     data = request.get_json() or {}
     days_old = data.get('days_old', 90)
     min_confidence = data.get('min_confidence', 0.3)
@@ -377,9 +367,10 @@ def cleanup_patterns():
             
             cursor.execute("""
                 DELETE FROM categorization_patterns
-                WHERE (last_used < %s OR confidence_score < %s OR usage_count < %s)
+                WHERE user_id = %s
+                AND (last_used < %s OR confidence_score < %s OR usage_count < %s)
                 AND created_at < %s
-            """, (cutoff_date, min_confidence, min_usage, cutoff_date))
+            """, (user_id, cutoff_date, min_confidence, min_usage, cutoff_date))
             
             deleted_count = cursor.rowcount
             db.commit()
