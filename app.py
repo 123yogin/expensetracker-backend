@@ -1,76 +1,99 @@
 """
 Personal Expense Tracker API
+==================================
 Flask REST API with PostgreSQL backend.
 
-Production-hardened version:
-- Debug mode disabled
-- CORS restricted to frontend origin
-- Centralized error handling
-- Database connection management via Flask g context
-- Idempotent database initialization (tables created on startup if not exist)
+Production-hardened:
+- Centralized configuration (no hardcoded secrets)
+- Connection pooling
+- Rate limiting
+- Security headers
+- Request logging with timing
+- Standardized error handling
+- Health check with DB verification
 """
 
+import logging
 import os
+import sys
+
 from flask import Flask, jsonify
 from flask_cors import CORS
-from dotenv import load_dotenv
-
-# Load environment variables from .env file (for local development)
-load_dotenv()
-
-from database import init_db, init_app as init_db_app
-from errors import register_error_handlers
-from blueprints.categories import categories_bp
-from blueprints.expenses import expenses_bp
-from blueprints.reports import reports_bp
-from blueprints.income import income_bp
-from blueprints.budgets import budgets_bp
-from blueprints.recurring_expenses import recurring_bp
-from blueprints.templates import templates_bp
-from blueprints.smart_features import smart_bp
-from blueprints.groups import groups_bp
-from blueprints.notifications import notifications_bp
-from blueprints.receipts import receipts_bp
-from blueprints.smart_categorization import smart_categorization_bp
-from blueprints.voice import voice_bp
-from blueprints.export import export_bp
-
-
-# Frontend origins - configure for your deployment
-# For local development with Vite, supports both default and alternate ports
-FRONTEND_ORIGINS = os.environ.get('FRONTEND_ORIGINS', 'http://localhost:5173,http://localhost:5174,http://192.168.1.3:5173').split(',')
 
 
 def create_app(testing: bool = False):
     """
     Application factory pattern.
-    
+
     Args:
         testing: If True, enable testing mode
-        
+
     Returns:
         Configured Flask application
     """
+    # ---- Configuration ----
+    from config import get_config
+    cfg = get_config()
+
+    # ---- Logging ----
+    logging.basicConfig(
+        level=getattr(logging, cfg.LOG_LEVEL, logging.INFO),
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        stream=sys.stdout,
+    )
+    logger = logging.getLogger(__name__)
+
+    # Log config warnings
+    for warning in cfg.validate():
+        logger.warning("CONFIG: %s", warning)
+
+    # ---- Flask App ----
     app = Flask(__name__)
-    
-    # Configuration
     app.config.update(
         TESTING=testing,
-        # Disable debug in production - controlled via environment
-        DEBUG=os.environ.get('FLASK_DEBUG', 'False').lower() == 'true',
+        DEBUG=cfg.DEBUG,
+        SECRET_KEY=cfg.SECRET_KEY,
+        MAX_CONTENT_LENGTH=cfg.MAX_UPLOAD_BYTES,
     )
-    
-    # Enable CORS only for the frontend origins (security hardening)
-    # This prevents other websites from making requests to our API
-    CORS(app, origins=FRONTEND_ORIGINS, supports_credentials=True)
-    
-    # Initialize database connection management
-    init_db_app(app)
-    
-    # Register centralized error handlers
+
+    # ---- CORS ----
+    CORS(
+        app,
+        origins=cfg.FRONTEND_ORIGINS,
+        supports_credentials=True,
+        allow_headers=["Content-Type", "Authorization", "X-Request-ID", "Cache-Control"],
+        methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    )
+
+    # ---- Middleware ----
+    from middleware import register_middleware, setup_rate_limiting
+    register_middleware(app)
+    setup_rate_limiting(app)
+
+    # ---- Database ----
+    from database import init_pool, close_db, run_migrations
+    app.teardown_appcontext(close_db)
+
+    # ---- Error Handlers ----
+    from errors import register_error_handlers
     register_error_handlers(app)
-    
-    # Register blueprints
+
+    # ---- Register Blueprints (existing) ----
+    from blueprints.categories import categories_bp
+    from blueprints.expenses import expenses_bp
+    from blueprints.reports import reports_bp
+    from blueprints.income import income_bp
+    from blueprints.budgets import budgets_bp
+    from blueprints.recurring_expenses import recurring_bp
+    from blueprints.templates import templates_bp
+    from blueprints.smart_features import smart_bp
+    from blueprints.groups import groups_bp
+    from blueprints.notifications import notifications_bp
+    from blueprints.receipts import receipts_bp
+    from blueprints.smart_categorization import smart_categorization_bp
+    from blueprints.voice import voice_bp
+    from blueprints.export import export_bp
+
     app.register_blueprint(categories_bp)
     app.register_blueprint(expenses_bp)
     app.register_blueprint(reports_bp)
@@ -85,65 +108,63 @@ def create_app(testing: bool = False):
     app.register_blueprint(smart_categorization_bp)
     app.register_blueprint(voice_bp)
     app.register_blueprint(export_bp)
-    
-    # Health check endpoint
-    @app.route('/health', methods=['GET'])
+
+    # ---- Health Check (with DB verification) ----
+    @app.route("/health", methods=["GET"])
     def health_check():
-        """Health check endpoint for monitoring."""
-        return jsonify({
-            'status': 'healthy',
-            'message': 'Expense Tracker API is running'
-        }), 200
-    
-    # Root endpoint - API documentation
-    @app.route('/', methods=['GET'])
+        """Health check endpoint for monitoring and load balancers."""
+        health = {"status": "healthy", "service": "expense-tracker-api"}
+
+        # Verify database connectivity
+        try:
+            from database import get_db
+            db = get_db()
+            with db.cursor() as cursor:
+                cursor.execute("SELECT 1")
+            health["database"] = "connected"
+        except Exception as e:
+            health["status"] = "degraded"
+            health["database"] = f"error: {str(e)}"
+            return jsonify(health), 503
+
+        return jsonify(health), 200
+
+    # ---- API Info ----
+    @app.route("/", methods=["GET"])
     def root():
-        """API documentation endpoint."""
         return jsonify({
-            'name': 'Personal Expense Tracker API',
-            'version': '1.1.0',
-            'endpoints': {
-                'categories': {
-                    'GET /categories': 'List all categories',
-                    'POST /categories': 'Create category',
-                    'PUT /categories/<id>': 'Rename category',
-                    'PATCH /categories/<id>/status': 'Update category status',
-                    'DELETE /categories/<id>': 'Soft delete category'
-                },
-                'expenses': {
-                    'GET /expenses': 'List expenses (with optional filters)',
-                    'POST /expenses': 'Create expense',
-                    'PUT /expenses/<id>': 'Update expense',
-                    'DELETE /expenses/<id>': 'Delete expense'
-                },
-                'reports': {
-                    'GET /reports/monthly-summary': 'Get monthly summary',
-                    'GET /reports/category-breakdown': 'Get category breakdown',
-                    'GET /reports/daily-trend': 'Get daily trend'
-                }
-            }
+            "name": "Personal Expense Tracker API",
+            "version": "2.0.0",
+            "docs": "/health for status",
         }), 200
-    
-    # Initialize database tables on app creation
+
+    # ---- Database Init ----
     with app.app_context():
-        init_db()
-    
+        init_pool(app)
+        try:
+            run_migrations()
+        except Exception as e:
+            logger.error("Migration failed (app will still start): %s", e)
+
+    logger.info(
+        "Application started (debug=%s, origins=%s)",
+        cfg.DEBUG,
+        cfg.FRONTEND_ORIGINS,
+    )
+
     return app
 
 
-# Create app instance for Gunicorn (production)
-# Gunicorn will call: gunicorn app:app
+# Create app instance for Gunicorn: gunicorn app:app
 app = create_app()
 
 
 # Local development
-if __name__ == '__main__':
-    # Run with debug DISABLED by default for production safety
-    # Set FLASK_DEBUG=true environment variable for development
-    debug_mode = os.environ.get('FLASK_DEBUG', 'False').lower() == 'true'
-    
+if __name__ == "__main__":
+    from config import get_config
+    cfg = get_config()
     app.run(
-        debug=debug_mode,
-        host='0.0.0.0',
-        port=int(os.environ.get('PORT', 5001))
+        debug=cfg.DEBUG,
+        host="0.0.0.0",
+        port=cfg.PORT,
     )

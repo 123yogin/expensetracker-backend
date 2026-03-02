@@ -1,7 +1,34 @@
+# ============================================
+# Expense Tracker Backend - Dependencies
+# ============================================
+
+# ----- Core Framework -----
 Flask==3.0.0
 flask-cors==4.0.0
-gunicorn==21.2.0
-psycopg2-binary==2.9.9
 python-dotenv==1.0.0
-reportlab==4.0.9
+
+# ----- Database -----
+psycopg2-binary==2.9.9
+
+# ----- Authentication -----
 python-jose[cryptography]==3.3.0
+cryptography==41.0.5
+
+# ----- Production WSGI -----
+gunicorn==21.2.0
+
+# ----- Security & Middleware -----
+flask-limiter==3.5.0
+
+# ----- PDF Export -----
+reportlab==4.0.9
+
+# ----- Testing -----
+pytest==8.0.0
+pytest-cov==4.1.0
+pytest-flask==1.3.0
+
+# ----- Code Quality -----
+# flake8==7.0.0
+# black==24.1.0
+# mypy==1.8.0

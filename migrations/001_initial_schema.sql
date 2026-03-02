@@ -1,6 +1,60 @@
 -- Migration 001: Initial Schema
 -- Includes categories, expenses, income, budgets, and recurring_expenses
 
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+
+-- PRE-MIGRATION: Ensure correct types if tables already exist as TEXT
+DO $$
+BEGIN
+    -- Fix categories.id if it is TEXT
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns 
+        WHERE table_name = 'categories' AND column_name = 'id' AND data_type = 'text'
+    ) THEN
+        -- Check if there are any existing foreign keys that might block the conversion
+        -- (Usually, if we are at Migration 001, we are either starting fresh or categories was created manually)
+        ALTER TABLE categories ALTER COLUMN id TYPE UUID USING id::uuid;
+    END IF;
+
+    -- Fix other tables if they exist as TEXT (e.g. from a partial previous migration)
+    -- expenses
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'expenses') THEN
+        IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'expenses' AND column_name = 'id' AND data_type = 'text') THEN
+            ALTER TABLE expenses ALTER COLUMN id TYPE UUID USING id::uuid;
+        END IF;
+        IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'expenses' AND column_name = 'category_id' AND data_type = 'text') THEN
+            ALTER TABLE expenses ALTER COLUMN category_id TYPE UUID USING category_id::uuid;
+        END IF;
+    END IF;
+
+    -- income
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'income') THEN
+        IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'income' AND column_name = 'id' AND data_type = 'text') THEN
+            ALTER TABLE income ALTER COLUMN id TYPE UUID USING id::uuid;
+        END IF;
+    END IF;
+
+    -- budgets
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'budgets') THEN
+        IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'budgets' AND column_name = 'id' AND data_type = 'text') THEN
+            ALTER TABLE budgets ALTER COLUMN id TYPE UUID USING id::uuid;
+        END IF;
+        IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'budgets' AND column_name = 'category_id' AND data_type = 'text') THEN
+            ALTER TABLE budgets ALTER COLUMN category_id TYPE UUID USING category_id::uuid;
+        END IF;
+    END IF;
+
+    -- recurring_expenses
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'recurring_expenses') THEN
+        IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'recurring_expenses' AND column_name = 'id' AND data_type = 'text') THEN
+            ALTER TABLE recurring_expenses ALTER COLUMN id TYPE UUID USING id::uuid;
+        END IF;
+        IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'recurring_expenses' AND column_name = 'category_id' AND data_type = 'text') THEN
+            ALTER TABLE recurring_expenses ALTER COLUMN category_id TYPE UUID USING category_id::uuid;
+        END IF;
+    END IF;
+END $$;
+
 CREATE TABLE IF NOT EXISTS categories (
     id UUID PRIMARY KEY,
     name TEXT UNIQUE NOT NULL,

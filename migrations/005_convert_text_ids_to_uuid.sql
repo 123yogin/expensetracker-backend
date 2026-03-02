@@ -158,10 +158,18 @@ BEGIN
     PERFORM safe_convert_text_to_uuid('recurring_expenses', 'category_id');
     
     -- Convert categorization_patterns (if exists)
+    PERFORM safe_convert_text_to_uuid('categorization_patterns', 'id');
     PERFORM safe_convert_text_to_uuid('categorization_patterns', 'category_id');
     
+    -- Convert export_logs (if exists)
+    PERFORM safe_convert_text_to_uuid('export_logs', 'id');
+    
     -- Convert offline_sync_queue (if exists)
+    PERFORM safe_convert_text_to_uuid('offline_sync_queue', 'id');
     PERFORM safe_convert_text_to_uuid('offline_sync_queue', 'record_id');
+    
+    -- Convert user_preferences (if exists)
+    PERFORM safe_convert_text_to_uuid('user_preferences', 'id');
     
     -- Convert expense_templates (if exists)
     PERFORM safe_convert_text_to_uuid('expense_templates', 'id');

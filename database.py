@@ -1,144 +1,160 @@
 """
-Database connection and initialization module.
-Handles PostgreSQL connection with connection pooling.
-
-Production-hardened version:
-- Uses Flask g context for per-request connections
-- Loads credentials from environment variables
-- Proper connection cleanup with teardown_appcontext
-- Idempotent table creation (safe to run multiple times)
+Database Module - Production-Ready Connection Pooling
+=====================================================
+Uses psycopg2 ThreadedConnectionPool for efficient connection reuse.
+Connections are acquired from pool per-request and returned automatically.
 """
 
-import os
+import logging
 import psycopg2
+import psycopg2.pool
 from psycopg2.extras import RealDictCursor
 from flask import g
-from dotenv import load_dotenv
 
-# Load environment variables from .env file
-load_dotenv()
+from config import get_config
+
+logger = logging.getLogger(__name__)
+
+# Module-level connection pool (initialized once)
+_pool: psycopg2.pool.ThreadedConnectionPool | None = None
 
 
-def get_database_url():
-    """
-    Get database URL from environment variable.
-    Render provides DATABASE_URL automatically for linked databases.
-    """
-    database_url = os.environ.get('DATABASE_URL')
-    
-    if not database_url:
-        raise RuntimeError("DATABASE_URL environment variable is not set")
-    
-    # Render uses 'postgres://' but psycopg2 requires 'postgresql://'
-    if database_url.startswith('postgres://'):
-        database_url = database_url.replace('postgres://', 'postgresql://', 1)
-    
-    return database_url
+def init_pool(app=None):
+    """Initialize the connection pool. Call once at application startup."""
+    global _pool
+    cfg = get_config()
+
+    if _pool is not None:
+        logger.warning("Connection pool already initialized, skipping.")
+        return
+
+    try:
+        _pool = psycopg2.pool.ThreadedConnectionPool(
+            minconn=cfg.DB_POOL_MIN_CONN,
+            maxconn=cfg.DB_POOL_MAX_CONN,
+            dsn=cfg.DATABASE_URL,
+            cursor_factory=RealDictCursor,
+        )
+        logger.info(
+            "Database connection pool created (min=%d, max=%d)",
+            cfg.DB_POOL_MIN_CONN,
+            cfg.DB_POOL_MAX_CONN,
+        )
+    except psycopg2.Error as e:
+        logger.critical("Failed to create database connection pool: %s", e)
+        raise
 
 
 def get_db():
     """
-    Get a database connection from Flask g context.
-    Creates a new connection if one doesn't exist for this request.
+    Get a database connection from the pool.
+    Connection is stored in Flask's `g` object and automatically
+    returned to the pool at the end of the request.
     """
-    if 'db' not in g:
-        g.db = psycopg2.connect(
-            get_database_url(),
-            cursor_factory=RealDictCursor  # Return rows as dictionaries
-        )
+    if "db" not in g:
+        if _pool is None:
+            raise RuntimeError(
+                "Database pool not initialized. Call init_pool() at app startup."
+            )
+        g.db = _pool.getconn()
     return g.db
 
 
-def close_db(e=None):
+def close_db(exception=None):
     """
-    Close the database connection at the end of request.
-    Registered as teardown_appcontext handler.
+    Return the connection to the pool at end of request.
+    If an exception occurred, rollback first.
     """
-    db = g.pop('db', None)
+    db = g.pop("db", None)
     if db is not None:
-        db.close()
+        if exception:
+            try:
+                db.rollback()
+            except Exception:
+                pass
+        try:
+            _pool.putconn(db)
+        except Exception:
+            pass
 
 
-def init_db():
+def shutdown_pool():
+    """Close all connections in the pool. Call at application shutdown."""
+    global _pool
+    if _pool is not None:
+        _pool.closeall()
+        _pool = None
+        logger.info("Database connection pool closed.")
+
+
+def run_migrations():
     """
-    Initialize the database by running all pending migrations.
-    This is IDEMPOTENT - safe to run multiple times.
-    
-    Tracks applied migrations in a 'schema_migrations' table.
+    Run SQL migration files in order.
+    Each migration is idempotent (uses IF NOT EXISTS, etc.).
     """
+    import os
+
+    cfg = get_config()
+    migrations_dir = os.path.join(os.path.dirname(__file__), "migrations")
+
+    if not os.path.exists(migrations_dir):
+        logger.warning("Migrations directory not found: %s", migrations_dir)
+        return
+
+    migration_files = sorted([
+        f for f in os.listdir(migrations_dir)
+        if f.endswith(".sql")
+    ])
+
+    if not migration_files:
+        logger.info("No migration files found.")
+        return
+
     conn = None
     try:
-        conn = psycopg2.connect(get_database_url())
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            # 1. Create migrations tracker table if it doesn't exist
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS schema_migrations (
+        conn = psycopg2.connect(cfg.DATABASE_URL)
+        conn.autocommit = False
+
+        with conn.cursor() as cursor:
+            # Create migrations tracking table
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS _migrations (
                     id SERIAL PRIMARY KEY,
                     filename TEXT UNIQUE NOT NULL,
                     applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                );
+                )
             """)
-            
-            # 2. Get list of already applied migrations
-            cur.execute("SELECT filename FROM schema_migrations")
-            rows = cur.fetchall()
-            
-            # Handle both tuple and dict responses
-            applied_migrations = set()
-            for row in rows:
-                if isinstance(row, dict):
-                    applied_migrations.add(row['filename'])
-                elif isinstance(row, (tuple, list)) and len(row) > 0:
-                    applied_migrations.add(row[0])
-            
-            # 3. Read migration files from folder
-            migrations_dir = os.path.join(os.path.dirname(__file__), 'migrations')
-            if not os.path.exists(migrations_dir):
-                print(f"[WARN] Migrations directory not found: {migrations_dir}")
-                return
 
-            migration_files = sorted([f for f in os.listdir(migrations_dir) if f.endswith('.sql')])
-            
-            # 4. Apply pending migrations
-            applied_count = 0
             for filename in migration_files:
-                if filename not in applied_migrations:
-                    print(f"[MIGRATE] Applying migration: {filename}...")
-                    with open(os.path.join(migrations_dir, filename), 'r') as f:
-                        sql = f.read()
-                        if sql.strip():
-                            cur.execute(sql)
-                    
-                    cur.execute(
-                        "INSERT INTO schema_migrations (filename) VALUES (%s)",
-                        (filename,)
-                    )
-                    applied_count += 1
-            
-            conn.commit()
-            if applied_count > 0:
-                print(f"[OK] Successfully applied {applied_count} new migrations.")
-            else:
-                print("[OK] Database is up to date. No new migrations applied.")
-                
-    except psycopg2.OperationalError as e:
-        print(f"[ERROR] Database connection error: {e}")
-        print("[TIP] Make sure PostgreSQL is running and the database exists.")
-        print("[TIP] Check your DATABASE_URL in the .env file.")
-        raise
+                # Check if already applied
+                cursor.execute(
+                    "SELECT 1 FROM _migrations WHERE filename = %s",
+                    (filename,)
+                )
+                if cursor.fetchone():
+                    continue
+
+                filepath = os.path.join(migrations_dir, filename)
+                logger.info("Applying migration: %s", filename)
+
+                with open(filepath, "r") as f:
+                    sql = f.read()
+
+                cursor.execute(sql)
+                cursor.execute(
+                    "INSERT INTO _migrations (filename) VALUES (%s)",
+                    (filename,)
+                )
+                logger.info("Migration applied: %s", filename)
+
+        conn.commit()
+        logger.info("All migrations completed successfully.")
+
     except Exception as e:
         if conn:
             conn.rollback()
-        print(f"[ERROR] Error during database migration: {e}")
+        logger.error("Migration failed: %s", e)
         raise
     finally:
         if conn:
             conn.close()
-
-
-def init_app(app):
-    """
-    Register database teardown with Flask app.
-    Called from create_app() in app.py.
-    """
-    app.teardown_appcontext(close_db)
