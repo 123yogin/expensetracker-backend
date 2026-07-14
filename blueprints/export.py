@@ -26,6 +26,20 @@ def format_currency(amount):
     return f"{float(amount):.2f}"
 
 
+def csv_safe(value):
+    """
+    Neutralize CSV formula injection: a cell beginning with = + - @ (or a
+    tab/CR) is interpreted as a formula by Excel/Sheets. Prefix such user-
+    supplied text with a single quote so it is treated as literal text.
+    """
+    if value is None:
+        return ''
+    text = str(value)
+    if text and text[0] in ('=', '+', '-', '@', '\t', '\r'):
+        return "'" + text
+    return text
+
+
 @export_bp.route('/csv', methods=['POST'])
 @require_auth
 def export_csv():
@@ -118,15 +132,15 @@ def export_csv():
                         'Expense',
                         str(expense['date']),
                         format_currency(expense['amount']),
-                        expense['category_name'],
-                        expense['note'] or '',
+                        csv_safe(expense['category_name']),
+                        csv_safe(expense['note']),
                         str(expense['created_at'])
                     ]
-                    
+
                     if any(e['is_split'] for e in expenses):
                         row.extend([
                             format_currency(expense['split_amount']) if expense['is_split'] else '',
-                            expense['split_with'] or ''
+                            csv_safe(expense['split_with'])
                         ])
                     
                     writer.writerow(row)
@@ -143,8 +157,8 @@ def export_csv():
                         'Income',
                         str(income['date']),
                         format_currency(income['amount']),
-                        income['source'],
-                        income['description'] or '',
+                        csv_safe(income['source']),
+                        csv_safe(income['description']),
                         str(income['created_at'])
                     ])
             
@@ -239,7 +253,7 @@ def export_summary_csv():
                 writer.writerow(['Category', 'Transactions', 'Total Amount', 'Average Amount', 'Min Amount', 'Max Amount'])
                 for row in results:
                     writer.writerow([
-                        row['category_name'],
+                        csv_safe(row['category_name']),
                         row['transaction_count'],
                         format_currency(row['total_amount']),
                         format_currency(row['avg_amount']),

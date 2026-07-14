@@ -36,6 +36,15 @@ def allowed_file(filename):
     """Check if file extension is allowed."""
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
+def csv_safe(value):
+    """Neutralize CSV formula injection by prefixing risky leading chars."""
+    if value is None:
+        return ''
+    text = str(value)
+    if text and text[0] in ('=', '+', '-', '@', '\t', '\r'):
+        return "'" + text
+    return text
+
 def format_expense_with_receipt(row) -> dict:
     """Format expense row with receipt information."""
     return {
@@ -463,11 +472,11 @@ def export_csv():
                 writer.writerow([
                     expense['date'],
                     format_amount(expense['amount']),
-                    expense['category'],
-                    expense['note'] or '',
+                    csv_safe(expense['category']),
+                    csv_safe(expense['note']),
                     'Yes' if expense['is_split'] else 'No',
                     format_amount(expense['split_amount']) if expense['split_amount'] else '',
-                    expense['split_with'] or '',
+                    csv_safe(expense['split_with']),
                     expense['created_at']
                 ])
             

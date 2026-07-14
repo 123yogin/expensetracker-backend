@@ -86,7 +86,7 @@ def setup_rate_limiting(app):
             app=app,
             key_func=get_remote_address,
             default_limits=[cfg.RATE_LIMIT_DEFAULT],
-            storage_uri="memory://",  # Use Redis in production: "redis://localhost:6379"
+            storage_uri=cfg.RATELIMIT_STORAGE_URI,  # memory:// by default; set RATELIMIT_STORAGE_URI=redis://... for multi-worker
         )
 
         # Store limiter on app for use in blueprints

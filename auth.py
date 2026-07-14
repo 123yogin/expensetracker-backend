@@ -8,7 +8,6 @@ This module provides:
 - Decorator for protecting API endpoints
 """
 
-import os
 import json
 import time
 import logging
@@ -20,16 +19,12 @@ from jose import jwt, JWTError
 from jose.exceptions import ExpiredSignatureError, JWTClaimsError
 
 from errors import error_response
+from config import get_config
 
 logger = logging.getLogger('expense_tracker.auth')
 
-# Cognito configuration from environment
-COGNITO_REGION = os.environ.get('COGNITO_REGION', 'us-east-1')
-COGNITO_USER_POOL_ID = os.environ.get('COGNITO_USER_POOL_ID', '')
-COGNITO_CLIENT_ID = os.environ.get('COGNITO_APP_CLIENT_ID', '')  # Match .env variable name
-
-# JWKS URL for Cognito (public keys for JWT verification)
-COGNITO_JWKS_URL = f"https://cognito-idp.{COGNITO_REGION}.amazonaws.com/{COGNITO_USER_POOL_ID}/.well-known/jwks.json"
+# Cognito configuration is sourced from the centralized, validated config
+# (config.get_config()) at call time — see get_jwks_keys() and validate_token().
 
 # Cache for JWKS keys (avoid fetching on every request)
 _jwks_cache = {
@@ -51,7 +46,8 @@ def get_jwks_keys():
         return _jwks_cache['keys']
     
     try:
-        with urlopen(COGNITO_JWKS_URL, timeout=5) as response:
+        jwks_url = get_config().COGNITO_JWKS_URL
+        with urlopen(jwks_url, timeout=5) as response:
             jwks = json.loads(response.read().decode('utf-8'))
             _jwks_cache['keys'] = jwks.get('keys', [])
             _jwks_cache['fetched_at'] = current_time
@@ -98,24 +94,25 @@ def validate_token(token):
     Raises:
         ValueError: If token is invalid
     """
-    if not COGNITO_USER_POOL_ID or not COGNITO_CLIENT_ID:
+    config = get_config()
+    if not config.COGNITO_USER_POOL_ID or not config.COGNITO_APP_CLIENT_ID:
         raise ValueError("Cognito configuration missing")
-    
+
     # Get the signing key
     key = get_key_for_token(token)
     if not key:
         raise ValueError("Unable to find signing key")
-    
+
     # Expected issuer
-    issuer = f"https://cognito-idp.{COGNITO_REGION}.amazonaws.com/{COGNITO_USER_POOL_ID}"
-    
+    issuer = config.COGNITO_ISSUER
+
     try:
         # Decode and validate the token
         claims = jwt.decode(
             token,
             key,
             algorithms=['RS256'],
-            audience=COGNITO_CLIENT_ID,
+            audience=config.COGNITO_APP_CLIENT_ID,
             issuer=issuer,
             options={
                 'verify_aud': True,

@@ -29,27 +29,42 @@ def allowed_file(filename):
     return '.' in filename and \
            filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
+
+def sniff_image_mime(head: bytes):
+    """
+    Detect the real image type from the leading bytes (magic numbers), so a
+    disguised/renamed non-image file is rejected regardless of its extension
+    or the client-supplied Content-Type. Returns the MIME string or None.
+    """
+    if head.startswith(b'\x89PNG\r\n\x1a\n'):
+        return 'image/png'
+    if head.startswith(b'\xff\xd8\xff'):
+        return 'image/jpeg'
+    if head.startswith(b'GIF87a') or head.startswith(b'GIF89a'):
+        return 'image/gif'
+    if head[:4] == b'RIFF' and head[8:12] == b'WEBP':
+        return 'image/webp'
+    return None
+
 def get_upload_folder():
     """Get the upload folder path, create if doesn't exist."""
     upload_folder = os.path.join(os.getcwd(), 'uploads', 'receipts')
     os.makedirs(upload_folder, exist_ok=True)
     return upload_folder
 
-def simulate_ocr(filename):
+def extract_receipt_data():
     """
-    Simulate OCR processing for receipt text extraction.
-    In a real implementation, this would use OCR libraries like Tesseract.
+    Placeholder for receipt OCR extraction.
+
+    OCR is NOT configured. Previously this fabricated a random amount/date,
+    which silently corrupted users' financial data. Until a real OCR pipeline
+    (e.g. Tesseract, AWS Textract) is wired in, receipts are stored as plain
+    photo attachments with NO auto-extracted values.
     """
-    extracted_text = f"Receipt from store - {filename}"
-    
-    import random
-    extracted_amount = round(random.uniform(10.0, 500.0), 2)
-    extracted_date = datetime.now().date()
-    
     return {
-        'text': extracted_text,
-        'amount': extracted_amount,
-        'date': extracted_date
+        'text': None,
+        'amount': None,
+        'date': None,
     }
 
 
@@ -79,7 +94,15 @@ def upload_receipt():
     
     if file_size > MAX_FILE_SIZE:
         return error_response("File too large. Maximum size is 10MB", 400)
-    
+
+    # Verify the actual bytes are a real image (defends against a renamed/
+    # disguised file), and use the detected MIME rather than trusting the client.
+    head = file.read(32)
+    file.seek(0)
+    detected_mime = sniff_image_mime(head)
+    if not detected_mime:
+        return error_response("File is not a valid image (PNG, JPG, GIF, or WEBP)", 400)
+
     expense_id = request.form.get('expense_id')
     if expense_id:
         valid, error = validate_uuid(expense_id)
@@ -102,24 +125,25 @@ def upload_receipt():
             receipt_id = generate_uuid()
             file_extension = file.filename.rsplit('.', 1)[1].lower()
             filename = f"{user_id}_{receipt_id}.{file_extension}"
+            original_filename = secure_filename(file.filename)
             
             # Save file
             upload_folder = get_upload_folder()
             file_path = os.path.join(upload_folder, filename)
             file.save(file_path)
             
-            # Simulate OCR processing
-            ocr_result = simulate_ocr(file.filename)
-            
+            # OCR is not configured — store the receipt as a photo attachment only.
+            ocr_result = extract_receipt_data()
+
             # Save receipt record with user_id
             cursor.execute("""
-                INSERT INTO receipt_photos 
-                (id, expense_id, filename, original_filename, file_size, mime_type, 
+                INSERT INTO receipt_photos
+                (id, expense_id, filename, original_filename, file_size, mime_type,
                  processed, extracted_text, extracted_amount, extracted_date, user_id)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """, (
-                receipt_id, expense_id, filename, file.filename, file_size,
-                file.content_type, True, ocr_result['text'], 
+                receipt_id, expense_id, filename, original_filename, file_size,
+                detected_mime, False, ocr_result['text'],
                 ocr_result['amount'], ocr_result['date'], user_id
             ))
             
@@ -137,9 +161,10 @@ def upload_receipt():
                 'filename': filename,
                 'original_filename': file.filename,
                 'file_size': file_size,
+                'processed': False,
                 'extracted_text': ocr_result['text'],
-                'extracted_amount': str(ocr_result['amount']),
-                'extracted_date': str(ocr_result['date']),
+                'extracted_amount': ocr_result['amount'],
+                'extracted_date': ocr_result['date'],
                 'expense_id': expense_id
             }), 201
             

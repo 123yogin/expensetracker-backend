@@ -14,11 +14,8 @@ from flask import jsonify
 import psycopg2
 from psycopg2 import errors as pg_errors
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+# Root logging is configured once in app.py (create_app). Here we only obtain
+# the module logger so log level/format stay under a single source of truth.
 logger = logging.getLogger('expense_tracker')
 
 

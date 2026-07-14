@@ -329,45 +329,61 @@ def get_trends():
     """
     user_id = get_current_user_id()
     count = request.args.get('months', 6, type=int)
-    
-    results = []
+    # Clamp to a sane range: each month runs its own queries, so an unbounded
+    # value (e.g. ?months=100000) would be a self-inflicted DoS.
+    if count is None or count < 1:
+        count = 1
+    elif count > 24:
+        count = 24
+
+    # Build the requested month strings, newest first.
+    months = []
     current_date = date.today().replace(day=1)
-    
+    for _ in range(count):
+        months.append(current_date.strftime('%Y-%m'))
+        if current_date.month == 1:
+            current_date = current_date.replace(year=current_date.year - 1, month=12)
+        else:
+            current_date = current_date.replace(month=current_date.month - 1)
+
+    # Overall date range covering every requested month.
+    oldest_start, _ = get_month_date_range(months[-1])
+    _, newest_end = get_month_date_range(months[0])
+
     db = get_db()
     try:
         with db.cursor() as cursor:
-            for i in range(count):
-                month_str = current_date.strftime('%Y-%m')
-                start_date, end_date = get_month_date_range(month_str)
-                
-                cursor.execute(
-                    "SELECT COALESCE(SUM(amount), 0) as total FROM expenses WHERE date >= %s AND date <= %s AND user_id = %s",
-                    (start_date, end_date, user_id)
-                )
-                exp = Decimal(str(cursor.fetchone()['total']))
-                
-                cursor.execute(
-                    "SELECT COALESCE(SUM(amount), 0) as total FROM income WHERE date >= %s AND date <= %s AND user_id = %s",
-                    (start_date, end_date, user_id)
-                )
-                inc = Decimal(str(cursor.fetchone()['total']))
-                
-                savings = inc - exp
-                rate = (savings / inc * 100) if inc > 0 else 0
-                
-                results.append({
-                    'month': month_str,
-                    'income': format_amount(inc),
-                    'expenses': format_amount(exp),
-                    'savings': format_amount(savings),
-                    'savings_rate': round(float(rate), 1)
-                })
-                
-                if current_date.month == 1:
-                    current_date = current_date.replace(year=current_date.year - 1, month=12)
-                else:
-                    current_date = current_date.replace(month=current_date.month - 1)
-        
+            # Two grouped aggregates instead of 2 queries per month (fixes N+1).
+            cursor.execute("""
+                SELECT to_char(date::date, 'YYYY-MM') AS ym, COALESCE(SUM(amount), 0) AS total
+                FROM expenses
+                WHERE user_id = %s AND date >= %s AND date <= %s
+                GROUP BY ym
+            """, (user_id, oldest_start, newest_end))
+            exp_by_month = {r['ym']: Decimal(str(r['total'])) for r in (cursor.fetchall() or [])}
+
+            cursor.execute("""
+                SELECT to_char(date::date, 'YYYY-MM') AS ym, COALESCE(SUM(amount), 0) AS total
+                FROM income
+                WHERE user_id = %s AND date >= %s AND date <= %s
+                GROUP BY ym
+            """, (user_id, oldest_start, newest_end))
+            inc_by_month = {r['ym']: Decimal(str(r['total'])) for r in (cursor.fetchall() or [])}
+
+        results = []
+        for month_str in months:
+            exp = exp_by_month.get(month_str, Decimal('0'))
+            inc = inc_by_month.get(month_str, Decimal('0'))
+            savings = inc - exp
+            rate = (savings / inc * 100) if inc > 0 else 0
+            results.append({
+                'month': month_str,
+                'income': format_amount(inc),
+                'expenses': format_amount(exp),
+                'savings': format_amount(savings),
+                'savings_rate': round(float(rate), 1)
+            })
+
         return jsonify(list(reversed(results))), 200
     except Exception as e:
         return handle_db_error(e)

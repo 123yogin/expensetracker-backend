@@ -61,6 +61,13 @@ class Config:
     RATE_LIMIT_DEFAULT: str = "60/minute"
     RATE_LIMIT_AUTH: str = "10/minute"
     RATE_LIMIT_WRITE: str = "30/minute"
+    # Shared storage for limits across workers/instances. Default is per-process
+    # memory (fine for a single worker); set to e.g. "redis://host:6379" in any
+    # multi-worker/multi-instance deployment so the limit is enforced globally.
+    RATELIMIT_STORAGE_URI: str = "memory://"
+    # Whether the app runs behind a trusted reverse proxy / load balancer. Only
+    # enable when it does — otherwise clients could spoof X-Forwarded-For.
+    TRUST_PROXY: bool = False
 
     # ---------- Logging ----------
     LOG_LEVEL: str = "INFO"
@@ -86,6 +93,8 @@ class Config:
         self.LOG_LEVEL = _get_env("LOG_LEVEL", "INFO").upper()
         self.UPLOAD_FOLDER = _get_env("UPLOAD_FOLDER", "uploads/receipts")
         self.MAX_UPLOAD_SIZE_MB = int(_get_env("MAX_UPLOAD_SIZE_MB", "5"))
+        self.RATELIMIT_STORAGE_URI = _get_env("RATELIMIT_STORAGE_URI", "memory://")
+        self.TRUST_PROXY = _get_env("TRUST_PROXY", "false").lower() in ("true", "1", "yes")
 
         # CORS origins (comma-separated)
         origins_str = _get_env("FRONTEND_ORIGINS", "http://localhost:5173")

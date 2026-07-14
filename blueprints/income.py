@@ -104,6 +104,39 @@ def get_income():
         return handle_db_error(e)
 
 
+@income_bp.route('/<income_id>', methods=['GET'])
+@require_auth
+def get_income_by_id(income_id):
+    """
+    GET /income/<id>
+    Fetch a single income record for the authenticated user.
+
+    Returns:
+        200: The income object
+        400: Invalid ID
+        404: Not found (or not owned by this user)
+    """
+    user_id = get_current_user_id()
+
+    valid, error = validate_uuid(income_id)
+    if not valid:
+        return error_response(f'Invalid income ID: {error}', 400)
+
+    db = get_db()
+    try:
+        with db.cursor() as cursor:
+            cursor.execute(
+                INCOME_SELECT_QUERY + " WHERE id = %s AND user_id = %s",
+                (income_id, user_id)
+            )
+            income = cursor.fetchone()
+        if not income:
+            return error_response('Income not found', 404)
+        return jsonify(format_income(income)), 200
+    except Exception as e:
+        return handle_db_error(e)
+
+
 @income_bp.route('', methods=['POST'])
 @require_auth
 def create_income():

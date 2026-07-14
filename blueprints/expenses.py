@@ -122,6 +122,39 @@ def get_expenses():
         return handle_db_error(e)
 
 
+@expenses_bp.route('/<expense_id>', methods=['GET'])
+@require_auth
+def get_expense(expense_id):
+    """
+    GET /expenses/<id>
+    Fetch a single expense for the authenticated user.
+
+    Returns:
+        200: The expense object
+        400: Invalid ID
+        404: Not found (or not owned by this user)
+    """
+    user_id = get_current_user_id()
+
+    valid, error = validate_uuid(expense_id)
+    if not valid:
+        return error_response(f'Invalid expense ID: {error}', 400)
+
+    db = get_db()
+    try:
+        with db.cursor() as cursor:
+            cursor.execute(
+                EXPENSE_SELECT_QUERY + " WHERE e.id = %s AND e.user_id = %s",
+                (expense_id, user_id)
+            )
+            row = cursor.fetchone()
+        if not row:
+            return error_response('Expense not found', 404)
+        return jsonify(format_expense(row)), 200
+    except Exception as e:
+        return handle_db_error(e)
+
+
 @expenses_bp.route('', methods=['POST'])
 @require_auth
 def create_expense():

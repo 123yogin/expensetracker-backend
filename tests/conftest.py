@@ -102,8 +102,11 @@ def mock_auth():
                 user_id = auth_header.replace("Bearer test-token-", "")
                 g.user_id = user_id
             else:
-                from responses import unauthorized
-                return unauthorized("Missing auth token")
+                from flask import jsonify
+                return jsonify({
+                    "success": False,
+                    "error": {"code": "UNAUTHORIZED", "message": "Missing auth token"}
+                }), 401
             return f(*args, **kwargs)
         return decorated
 

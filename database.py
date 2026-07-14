@@ -63,15 +63,20 @@ def get_db():
 def close_db(exception=None):
     """
     Return the connection to the pool at end of request.
-    If an exception occurred, rollback first.
+
+    Always roll back before returning the connection: on success the handler
+    already committed, so this is a no-op; but when a handler caught its own
+    DB error and returned a response, Flask passes exception=None here, and
+    without this rollback the connection would go back to the pool still
+    inside an aborted transaction — poisoning the next request that reuses it
+    ("current transaction is aborted, commands ignored").
     """
     db = g.pop("db", None)
     if db is not None:
-        if exception:
-            try:
-                db.rollback()
-            except Exception:
-                pass
+        try:
+            db.rollback()
+        except Exception:
+            pass
         try:
             _pool.putconn(db)
         except Exception:
@@ -110,12 +115,24 @@ def run_migrations():
         logger.info("No migration files found.")
         return
 
+    # Constant key for a session-level advisory lock. When the app runs with
+    # multiple workers/instances, they all call run_migrations() at boot; this
+    # lock ensures exactly ONE applies migrations while the others block, then
+    # find every migration already recorded in _migrations and no-op. Without
+    # it, concurrent ALTER/DELETE migrations can deadlock or partially apply.
+    MIGRATION_LOCK_KEY = 4021999
+
     conn = None
+    lock_acquired = False
     try:
         conn = psycopg2.connect(cfg.DATABASE_URL)
         conn.autocommit = False
 
         with conn.cursor() as cursor:
+            # Serialize migration runs across workers/instances.
+            cursor.execute("SELECT pg_advisory_lock(%s)", (MIGRATION_LOCK_KEY,))
+            lock_acquired = True
+
             # Create migrations tracking table
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS _migrations (
@@ -156,5 +173,13 @@ def run_migrations():
         logger.error("Migration failed: %s", e)
         raise
     finally:
-        if conn:
+        # Release the advisory lock and close the dedicated connection.
+        if conn is not None:
+            if lock_acquired:
+                try:
+                    with conn.cursor() as cursor:
+                        cursor.execute("SELECT pg_advisory_unlock(%s)", (MIGRATION_LOCK_KEY,))
+                    conn.commit()
+                except Exception:
+                    pass
             conn.close()

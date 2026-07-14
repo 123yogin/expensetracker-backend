@@ -56,6 +56,15 @@ def create_app(testing: bool = False):
         MAX_CONTENT_LENGTH=cfg.MAX_UPLOAD_BYTES,
     )
 
+    # ---- Trusted proxy ----
+    # Behind a load balancer / reverse proxy, use the real client IP from
+    # X-Forwarded-For (for logging and rate limiting). Only when TRUST_PROXY is
+    # set, so clients can't spoof the header in a direct-exposure deployment.
+    if cfg.TRUST_PROXY:
+        from werkzeug.middleware.proxy_fix import ProxyFix
+        app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
+        logger.info("ProxyFix enabled (trusting X-Forwarded-* from one proxy hop)")
+
     # ---- CORS ----
     CORS(
         app,
@@ -155,7 +164,7 @@ def create_app(testing: bool = False):
     return app
 
 
-# Create app instance for Gunicorn: gunicorn app:app
+# Module-level app instance (used by `python app.py` and any WSGI server)
 app = create_app()
 
 
