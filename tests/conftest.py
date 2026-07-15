@@ -17,7 +17,8 @@ from decimal import Decimal
 # Set test environment BEFORE importing app
 os.environ["DATABASE_URL"] = os.environ.get(
     "TEST_DATABASE_URL",
-    "postgresql://expense_user:expense_password_2024@localhost:5432/expense_tracker_test"
+    # Neutral local default; set TEST_DATABASE_URL to your own test DB.
+    "postgresql://postgres:postgres@localhost:5432/expense_tracker_test"
 )
 os.environ["COGNITO_USER_POOL_ID"] = "ap-south-1_TestPool"
 os.environ["COGNITO_REGION"] = "ap-south-1"
